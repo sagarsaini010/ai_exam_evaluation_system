@@ -4,7 +4,52 @@ const storage = new Storage({
   keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS
 });
 
-const bucketName = "copy-checking-bucket-asia";
+const defaultBucketName = "copy-checking-bucket-asia";
+
+function sanitizeSegment(value) {
+  return String(value)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function buildBucketName({ schoolName, branchId }) {
+  const school = sanitizeSegment(schoolName);
+  const branch = sanitizeSegment(branchId || "default");
+
+  // GCS bucket max length is 63 chars.
+  const raw = `school-${school}-${branch}`;
+  return raw.slice(0, 63);
+}
+
+function buildStudentPath({ classId, sectionId, studentId, fileName }) {
+  const safeFileName = `${Date.now()}-${fileName.replace(/[^a-zA-Z0-9.-]/g, "_")}`;
+  return [
+    "classes",
+    sanitizeSegment(classId),
+    "sections",
+    sanitizeSegment(sectionId),
+    "students",
+    sanitizeSegment(studentId),
+    safeFileName,
+  ].join("/");
+}
+
+async function ensureBucketExists(bucketName) {
+  const bucket = storage.bucket(bucketName);
+  const [exists] = await bucket.exists();
+
+  if (!exists) {
+    await storage.createBucket(bucketName, {
+      location: process.env.GCS_BUCKET_LOCATION || "asia-south1",
+      storageClass: process.env.GCS_BUCKET_STORAGE_CLASS || "STANDARD",
+    });
+  }
+
+  return bucket;
+}
 
 export async function processData(req, res) {
   try {
@@ -12,8 +57,7 @@ export async function processData(req, res) {
       return res.status(400).json({ success: false, message: "No files uploaded" });
     }
 
-    const bucket = storage.bucket(bucketName);
-    const results = [];
+    const bucket = storage.bucket(defaultBucketName);
 
     const uploadPromises = req.files.map(async (file) => {
       const safeName = `${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
@@ -70,32 +114,55 @@ export async function processData(req, res) {
 
 export async function generateUploadUrl(req, res) {
   try {
-    const { fileName, contentType, metadata = {} } = req.body; // metadata: { examId, studentId }
-    console.log("Generating upload URL for:", { fileName, contentType, metadata });
-    if (!fileName || !contentType) {
-      return res.status(400).json({ success: false, message: "fileName and contentType required" });
+    const {
+      fileName,
+      contentType,
+      schoolName,
+      branchId,
+      classId,
+      sectionId,
+      studentId,
+      metadata = {},
+    } = req.body;
+
+    if (!fileName || !contentType || !schoolName || !classId || !sectionId || !studentId) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "fileName, contentType, schoolName, classId, sectionId and studentId are required",
+      });
     }
-    
-    const safeName = `${Date.now()}-${fileName.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
-    const file = storage.bucket(bucketName).file(`uploads/${safeName}`);
+
+    const bucketName = buildBucketName({ schoolName, branchId });
+    const bucket = await ensureBucketExists(bucketName);
+    const filePath = buildStudentPath({ classId, sectionId, studentId, fileName });
+    const file = bucket.file(filePath);
 
     const [signedUrl] = await file.getSignedUrl({
       version: "v4",
       action: "write",
-      expires: Date.now() + 15 * 60 * 1000, // 15 min — enough for upload
+      expires: Date.now() + 15 * 60 * 1000,
       contentType,
-      // optional: virtualHostedStyle: true (if custom domain)
+      extensionHeaders: {
+        "x-goog-meta-school-name": schoolName,
+        "x-goog-meta-branch-id": String(branchId || ""),
+        "x-goog-meta-class-id": String(classId),
+        "x-goog-meta-section-id": String(sectionId),
+        "x-goog-meta-student-id": String(studentId),
+      },
     });
 
     res.json({
       success: true,
       uploadUrl: signedUrl,
-      filePath: file.name,
-      expiresIn: "15 minutes"
+      bucketName,
+      filePath,
+      expiresIn: "15 minutes",
+      metadata,
     });
 
   } catch (error) {
-    console.error(error);
+    console.error("Generate upload URL error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 }
