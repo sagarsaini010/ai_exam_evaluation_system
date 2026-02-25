@@ -1,5 +1,5 @@
 import { Storage } from "@google-cloud/storage";
-
+import path from "path";
 const storage = new Storage({
   keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS
 });
@@ -112,6 +112,10 @@ export async function processData(req, res) {
   }
 }
 
+
+// 🔥 Single central bucket
+const CENTRAL_BUCKET = process.env.CENTRAL_BUCKET || "ai-exam-storage-470609-q7";
+
 export async function generateUploadUrl(req, res) {
   try {
     const {
@@ -122,10 +126,16 @@ export async function generateUploadUrl(req, res) {
       classId,
       sectionId,
       studentId,
-      metadata = {},
     } = req.body;
 
-    if (!fileName || !contentType || !schoolName || !classId || !sectionId || !studentId) {
+    if (
+      !fileName ||
+      !contentType ||
+      !schoolName ||
+      !classId ||
+      !sectionId ||
+      !studentId
+    ) {
       return res.status(400).json({
         success: false,
         message:
@@ -133,9 +143,17 @@ export async function generateUploadUrl(req, res) {
       });
     }
 
-    const bucketName = buildBucketName({ schoolName, branchId });
-    const bucket = await ensureBucketExists(bucketName);
-    const filePath = buildStudentPath({ classId, sectionId, studentId, fileName });
+    // ✅ Safe folder structure inside single bucket
+    const filePath = path.posix.join(
+      schoolName,
+      branchId ? String(branchId) : "default",
+      String(classId),
+      String(sectionId),
+      String(studentId),
+      fileName
+    );
+
+    const bucket = storage.bucket(CENTRAL_BUCKET);
     const file = bucket.file(filePath);
 
     const [signedUrl] = await file.getSignedUrl({
@@ -143,26 +161,21 @@ export async function generateUploadUrl(req, res) {
       action: "write",
       expires: Date.now() + 15 * 60 * 1000,
       contentType,
-      extensionHeaders: {
-        "x-goog-meta-school-name": schoolName,
-        "x-goog-meta-branch-id": String(branchId || ""),
-        "x-goog-meta-class-id": String(classId),
-        "x-goog-meta-section-id": String(sectionId),
-        "x-goog-meta-student-id": String(studentId),
-      },
     });
 
-    res.json({
+    return res.json({
       success: true,
       uploadUrl: signedUrl,
-      bucketName,
+      bucketName: CENTRAL_BUCKET,
       filePath,
       expiresIn: "15 minutes",
-      metadata,
     });
 
   } catch (error) {
     console.error("Generate upload URL error:", error);
-    res.status(500).json({ success: false, message: error.message });
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
   }
 }
