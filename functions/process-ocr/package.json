@@ -2,11 +2,18 @@
   "name": "process-ocr",
   "version": "1.0.0",
   "main": "index.js",
-  "engines": { "node": "20" },
+  "type": "commonjs",
+  "engines": {
+    "node": "20"
+  },
+  "scripts": {
+    "start": "functions-framework --target=processOCR"
+  },
   "dependencies": {
     "@google-cloud/functions-framework": "^3.4.0",
     "@google-cloud/documentai": "^8.0.0",
     "@google-cloud/storage": "^7.0.0",
-    "@google/generative-ai": "^0.12.0" 
+    "@google-cloud/pubsub": "^4.0.0",
+    "@google/generative-ai": "^0.12.0"
   }
 }

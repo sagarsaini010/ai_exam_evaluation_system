@@ -2,7 +2,9 @@ const path = require('path');
 const functions = require('@google-cloud/functions-framework');
 const { DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1;
 const { Storage } = require('@google-cloud/storage');
-
+const { PubSub } = require('@google-cloud/pubsub');
+const pubsub = new PubSub();
+const TOPIC_NAME = process.env.OCR_TOPIC || 'exam-ocr-completed';
 const projectId = process.env.GCP_PROJECT_ID || 'secure-brook-470609-q7';
 const location = process.env.DOCUMENT_AI_LOCATION || 'asia-south1';
 const processorId = process.env.DOCUMENT_AI_PROCESSOR_ID || 'f9b5a9f31d819f11';
@@ -65,7 +67,7 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
         sourceFile: filePath,
         bucket: bucketName,
         text: document.text || '',
-        document,
+        totalPages: document.pages?.length || 0,
         generatedAt: new Date().toISOString(),
       }, null, 2),
       {
@@ -75,6 +77,19 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
     );
 
     console.log(`OCR output saved: gs://${bucketName}/${outputPath}`);
+    // 🔥 Publish message to Pub/Sub
+const messageData = {
+  bucket: bucketName,
+  ocrPath: outputPath,
+  sourceFile: filePath,
+  generatedAt: new Date().toISOString(),
+};
+
+await pubsub
+  .topic(TOPIC_NAME)
+  .publishMessage({ data: Buffer.from(JSON.stringify(messageData)) });
+
+console.log(`Pub/Sub message published for ${outputPath}`);
   } catch (error) {
     console.error(`OCR processing failed for gs://${bucketName}/${filePath}:`, error.message);
   }
@@ -86,4 +101,30 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
 
 
 // gcloud functions deploy processOCR --gen2 --runtime nodejs22 --region asia-south1 --source functions/process-ocr --entry-point processOCR --trigger-event-filters="type=google.cloud.storage.object.v1.finalized" --trigger-event-filters="bucket=ai-exam-storage-470609-q7"
+
+
+    // const [result] = await docAIClient.processDocument(request);
+    // const document = result.document;
+
+    // if (!document) throw new Error('Document AI returned no document.');
+
+    // const outputPath = buildOcrOutputPath(filePath);
+
+    // // FIX: Only save essential data, exclude the massive 'pages' array
+    // const slimOutput = {
+    //   sourceFile: filePath,
+    //   bucket: bucketName,
+    //   text: document.text || '', // The actual extracted text
+    //   entities: document.entities || [], // Key-Value pairs (if using a form processor)
+    //   generatedAt: new Date().toISOString(),
+    // };
+
+    // await storage.bucket(bucketName).file(outputPath).save(
+    //   JSON.stringify(slimOutput, null, 2),
+    //   {
+    //     contentType: 'application/json',
+    //     metadata: { metadata: { ocrGenerated: 'true', sourceFile: filePath } },
+    //   }
+    // );
+
 
