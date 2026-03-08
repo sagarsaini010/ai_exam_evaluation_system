@@ -159,12 +159,12 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
     generatedAt: new Date().toISOString(),
     // Student context — written by upload API, forwarded here for the AI pipeline
     student: {
-      schoolName: customMetadata.schoolName || null,
-      branchId:   customMetadata.branchId   || null,
-      classId:    customMetadata.classId    || null,
-      sectionId:  customMetadata.sectionId  || null,
-      studentId:  customMetadata.studentId  || null,
-    },
+  schoolName: customMetadata.schoolname || null,
+  branchId:   customMetadata.branchid   || null,
+  classId:    customMetadata.classid    || null,
+  sectionId:  customMetadata.sectionid  || null,
+  studentId:  customMetadata.studentid  || null,
+},
   };
 
   await storage.bucket(bucketName).file(outputPath).save(
@@ -238,6 +238,3 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
     });
   }
 });
-
-
-// gcloud projects add-iam-policy-binding secure-brook-470609-q7 --member="serviceAccount:ocr-processor-sa@secure-brook-470609-q7.iam.gserviceaccount.com" --role="roles/storage.objectViewer"
