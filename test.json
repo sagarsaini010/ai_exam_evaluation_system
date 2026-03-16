@@ -1,0 +1,74 @@
+{
+  "segmentedAnswers": {
+    "questions": [
+      {
+        "questionNumber": "(क)",
+        "answer": "उत्तर- (ii) सममित"
+      },
+      {
+        "questionNumber": "(ख)",
+        "answer": "उत्तर (i) sin x"
+      },
+      {
+        "questionNumber": "(ग)",
+        "answer": "उत्तर - (ii) m/n"
+      },
+      {
+        "questionNumber": "(घ)",
+        "answer": "उत्तर - (iii) 0"
+      },
+      {
+        "questionNumber": "(ङ)",
+        "answer": "उत्तर (i) π/6"
+      },
+      {
+        "questionNumber": "2(i)",
+        "answer": "sin⁻¹(1-x) - 2 sin⁻¹ x = π/2\nsin⁻¹(1-x) = π/2 + 2 sin⁻¹ x\nदोनों ओर sin लेने पर -\nsin(sin⁻¹(1-x)) = sin(π/2 + 2 sin⁻¹ x)\n1-x = cos(2 sin⁻¹ x)\nमाना sin⁻¹ x = θ, तब x = sin θ\n1-x = cos 2θ\n1-x = 1-2 sin² θ\n1-x = 1-2x²\n2x² - x = 0\nx(2x-1) = 0\nसमी० से -\nx = 0, 2x-1 = 0\n2x = 1\nx = 1/2\nअतः x = 1/2 पर समी० सन्तुष्ट नहीं करती है इसलिए मान के नहीं ले सकते है इसलिए -\nx का मान शून्य होगा.\nx = 0"
+      },
+      {
+        "questionNumber": "2(ii)",
+        "answer": "दिया है A एक वर्ग आव्यूह है.\nसिद्ध करना है (A + A') एक सममित आव्यूह है.\nमाना A एक सममित आव्यूह है.\nतब- A' = A\nइसी प्रकार - A + A' के लिए -\n(A + A')' = A' + (A')'\n(A')' = A\n(A + A')' = A' + A\nक्रमविनियम नियम के अनुसार - A' + A = A + A'\nसिद्ध होता है कि (A + A') एक सममित आव्यूह है."
+      },
+      {
+        "questionNumber": "2(iii)",
+        "answer": "y = |x|\nमाना x = c पर फलन सतत है जहाँ c वास्तविक संख्या है.\nLHL = RHL = f(c)\nLim f(c-h) = Lim f(c+h) = f(c)\nf(x) = |x|\nLim |c-h| = Lim |c+h| = |c|\n|c| = |c| = |c|\nअतः x = c पर फलन सतत है."
+      },
+      {
+        "questionNumber": "2(iv)",
+        "answer": "y = cos(√x)\nx के सापेक्ष अवकलन करने पर -\ndy/dx = -sin(√x) * d/dx(√x)\ndy/dx = -sin(√x) * 1/(2√x)\ndy/dx = -sin(√x) / (2√x)"
+      },
+      {
+        "questionNumber": "2(v)",
+        "answer": "∫ log x dx = x log x - x + C"
+      },
+      {
+        "questionNumber": "3(i)",
+        "answer": "∫ e²x / (e²x + e⁻²x) dx\n= 1/2 log |e²x + e⁻²x| + C"
+      },
+      {
+        "questionNumber": "3(ii)",
+        "answer": "dy/dx + 3y = e⁻²x\nI.F = e³x\ny.e³x = ∫ e⁻²x . e³x dx\ny.e³x = e^x + C\ny = e⁻²x + C e⁻³x"
+      },
+      {
+        "questionNumber": "3(iii)",
+        "answer": "|a| = 2, |b| = 3, a.b = 4\n|a-b|² = |a|² + |b|² - 2(a.b)\n|a-b|² = 4 + 9 - 8 = 5\n|a-b| = √5"
+      },
+      {
+        "questionNumber": "3(iv)",
+        "answer": "P(A) = 7/13, P(B) = 9/13, P(A∩B) = 4/13\nP(A|B) = P(A∩B) / P(B)\nP(A|B) = (4/13) / (9/13) = 4/9"
+      },
+      {
+        "questionNumber": "4(i)",
+        "answer": "f(x) = 4x + 3\nमाना f(x₁) = f(x₂)\n4x₁ + 3 = 4x₂ + 3\nx₁ = x₂\nअतः फलन एकैक है.\ny = 4x + 3\nx = (y-3)/4 ∈ R\nअतः फलन अच्छादक भी है.\nइसलिए फलन एकैक-अच्छादक है तथा व्युत्क्रमणीय है."
+      },
+      {
+        "questionNumber": "4(ii)",
+        "answer": "cot⁻¹ (1 / √(x²-1))\nमाना x = sec θ\nθ = sec⁻¹ x\ncot⁻¹ (1 / √(sec²θ-1)) = cot⁻¹ (1/tan θ)\n= cot⁻¹ (cot θ)\n= θ\n= sec⁻¹ x"
+      },
+      {
+        "questionNumber": "4(iii)",
+        "answer": "x²/³ + y²/³ = a²/³\n2/3 x⁻¹/³ + 2/3 y⁻¹/³ (dy/dx) = 0\n2/3 y⁻¹/³ (dy/dx) = -2/3 x⁻¹/³\ndy/dx = -(x⁻¹/³ / y⁻¹/³)\ndy/dx = -(y/x)¹/³"
+      }
+    ]
+  }
+}

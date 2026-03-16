@@ -89,24 +89,40 @@ async function callLLM(text) {
   const prompt = `
 You are an AI system that segments OCR text of handwritten exam answer sheets.
 
-Your task is ONLY to split the OCR text into answers.
+Your task is to detect questions and segment the sheet into structured JSON.
 
-DO NOT change any text.
+DO NOT modify the OCR text.
+
+--------------------------------
+
+GOAL
+
+From the OCR text:
+
+1. Detect question numbers.
+2. If the question text is present in the answer sheet, include it.
+3. Extract the student answer that follows the question.
 
 --------------------------------
 
 RULES FOR QUESTION DETECTION
 
-1. Detect question numbers exactly as written.
+Detect question numbers exactly as written.
 
-Examples:
+Examples of question numbering:
+
 (क) (ख) (ग) (घ) (ङ)
 (i) (ii) (iii) (iv) (v)
 1(i) 2(ii)
-Q1 Q2
+1(a) 1(b)
+Q1 Q2 Q3
 प्रश्नोत्तर सं० - 2
 
-2. If a section header appears like:
+--------------------------------
+
+SECTION RULE
+
+If a section header appears like:
 
 "प्रश्नोत्तर सं० - 2"
 
@@ -122,34 +138,64 @@ then the correct question numbers must be:
 2(iv)
 2(v)
 
-3. Each answer begins AFTER the question number and continues until the next question number appears.
+--------------------------------
 
-4. Do NOT modify OCR text.
+QUESTION + ANSWER RULE
 
-5. Do NOT fix spelling.
+If the OCR text contains both the **question statement and the answer**, then:
 
-6. Do NOT correct mathematics.
+• The question statement must be stored in "question"
+• The student response must be stored in "answer"
 
-7. Preserve the text exactly as written.
+The answer begins **after the question statement ends**.
 
-8. If OCR text looks incorrect, keep it unchanged.
+--------------------------------
 
-OUTPUT FORMAT (STRICT JSON):
+IF QUESTION TEXT IS NOT PRESENT
+
+If the answer sheet only contains the answer and not the question text:
+
+• Set "question": null
+• Extract the full answer normally.
+
+--------------------------------
+
+IMPORTANT RULES
+
+1. DO NOT change OCR text.
+2. DO NOT fix spelling.
+3. DO NOT correct grammar.
+4. DO NOT rewrite text.
+5. Preserve \n.
+6. If OCR text looks incorrect, keep it unchanged.
+7. Fix broken OCR words but DO NOT rewrite sentences.
+8. Only merge words that were split incorrectly.
+9. Don't do mistakes like broke words ex => "humani            ity, आ                                    आने, नैतिक                        क, p       practice"
+--------------------------------
+
+OUTPUT FORMAT (STRICT JSON)
 
 {
   "questions": [
     {
       "questionNumber": "...",
+      "question": "...",
       "answer": "..."
     }
   ]
 }
 
-IMPORTANT:
+--------------------------------
+
+IMPORTANT
+
 Return ONLY JSON.
+
 No explanation.
 No markdown.
-No additional text.
+No extra text.
+
+--------------------------------
 
 OCR TEXT:
 ${text}

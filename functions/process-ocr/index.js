@@ -50,6 +50,52 @@ function buildOcrOutputPath(filePath) {
 }
 
 /**
+ * Document AI response se layout-aware pages banata hai.
+ * Har page mein lines aur page-level average confidence hoti hai.
+ */
+function extractLayoutPages(document) {
+  if (!document.pages || document.pages.length === 0) return [];
+
+  const fullText = document.text || '';
+
+  return document.pages.map((page) => {
+    const pageNumber = page.pageNumber ?? 1;
+
+    // ── Lines extract karo ──────────────────────────────────────
+    const lines = (page.lines || []).map((line) => {
+      const segments = line.layout?.textAnchor?.textSegments || [];
+      const lineText = segments
+        .map((seg) => {
+          const start = Number(seg.startIndex || 0);
+          const end   = Number(seg.endIndex   || 0);
+          return fullText.slice(start, end);
+        })
+        .join('')
+        .replace(/\n$/, '')   // trailing newline hatao
+        .trim();
+      return lineText;
+    }).filter(line => line.length > 0);   // empty lines hatao
+
+    // ── Page confidence — token-level average ───────────────────
+    const tokens = page.tokens || [];
+    let pageConfidence = null;
+
+    if (tokens.length > 0) {
+      const sum = tokens.reduce(
+        (acc, t) => acc + (t.layout?.confidence ?? 0), 0
+      );
+      pageConfidence = Number((sum / tokens.length).toFixed(4));
+    }
+
+    return {
+      page:       pageNumber,
+      confidence: pageConfidence,
+      lines,
+    };
+  });
+}
+
+/**
  * Returns true if this GCS event should be ignored:
  * - Already an OCR output file
  * - Already processed (flag written by this function)
@@ -143,28 +189,54 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
   }
 
   const document = result.document;
+
   if (!document) {
     log.error('OCR_EMPTY_RESPONSE', { bucket: bucketName, file: filePath });
     return;
   }
 
+  // ── Extract confidence scores ───────────────────────────────────────────
+
+  // Token-level confidence (Document AI actual structure)
+  let pageConfidences = [];
+  let avgConfidence = null;
+
+  if (document.pages && document.pages.length > 0) {
+    pageConfidences = document.pages.map(page => {
+      const tokens = page.tokens || [];
+      if (tokens.length === 0) return null;
+      const sum = tokens.reduce((acc, t) => acc + (t.layout?.confidence ?? 0), 0);
+      return Number((sum / tokens.length).toFixed(4));
+    }).filter(v => v !== null);
+
+    if (pageConfidences.length > 0) {
+      const total = pageConfidences.reduce((a, b) => a + b, 0);
+      avgConfidence = Number((total / pageConfidences.length).toFixed(4));
+    }
+  }
+
   // ── Save OCR output to GCS ────────────────────────────────────────────────
   const outputPath = buildOcrOutputPath(filePath);
 
+  const layoutPages = extractLayoutPages(document);
+
   const ocrPayload = {
-    sourceFile:  filePath,
-    bucket:      bucketName,
-    text:        document.text || '',
-    totalPages:  document.pages?.length || 0,
-    generatedAt: new Date().toISOString(),
+    sourceFile:     filePath,
+    bucket:         bucketName,
+    text:           document.text || '',
+    totalPages:     document.pages?.length || 0,
+    avgConfidence:  avgConfidence,
+    pageConfidence: pageConfidences,
+    pages:          layoutPages,
+    generatedAt:    new Date().toISOString(),
     // Student context — written by upload API, forwarded here for the AI pipeline
     student: {
-  schoolName: customMetadata.schoolname || null,
-  branchId:   customMetadata.branchid   || null,
-  classId:    customMetadata.classid    || null,
-  sectionId:  customMetadata.sectionid  || null,
-  studentId:  customMetadata.studentid  || null,
-},
+      schoolName: customMetadata.schoolname || null,
+      branchId:   customMetadata.branchid   || null,
+      classId:    customMetadata.classid    || null,
+      sectionId:  customMetadata.sectionid  || null,
+      studentId:  customMetadata.studentid  || null,
+    },
   };
 
   await storage.bucket(bucketName).file(outputPath).save(
@@ -189,6 +261,16 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
     totalPages: ocrPayload.totalPages,
     textLength: ocrPayload.text.length,
   });
+
+  try {
+    await storage.bucket(bucketName).file(filePath).setMetadata({
+      metadata: { ocrGenerated: 'true' },
+    });
+    log.info('OCR_SOURCE_MARKED', { bucket: bucketName, file: filePath });
+  } catch (err) {
+    // Non-fatal — OCR already saved, sirf warning log karo
+    log.warn('OCR_SOURCE_MARK_FAILED', { bucket: bucketName, file: filePath, error: err.message });
+  }
 
   // ── Publish to Pub/Sub (with retry) ──────────────────────────────────────
   const message = {
