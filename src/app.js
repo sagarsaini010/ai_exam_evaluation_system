@@ -17,7 +17,6 @@ app.get("/health", (req, res) => {
 });
 
 app.use('/api/v1', dataRoutes);   // recive pdf and jpeg file from frontend and send it to controller for processing
-
 app.use((req, res) => {
   res.status(404).json({
     success: false,

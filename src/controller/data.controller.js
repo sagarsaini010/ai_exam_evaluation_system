@@ -1,16 +1,16 @@
 import { Storage } from "@google-cloud/storage";
-
+import { Firestore } from '@google-cloud/firestore';
+import { v4 as uuidv4 } from 'uuid';
 // Uses Application Default Credentials (ADC) — no key file needed in production.
 // Locally: run `gcloud auth application-default login`
 // On GCP (Cloud Run / GKE): workload identity is picked up automatically.
 const storage = new Storage({
    keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS
 });
-
+const firestore = new Firestore({ projectId: process.env.PROJECT_ID });
 // ─── Config ───────────────────────────────────────────────────────────────────
 const CENTRAL_BUCKET       = process.env.CENTRAL_BUCKET || "ai-exam-storage-470609-q7";
-const SIGNED_URL_EXPIRY_MS = 60 * 60 * 1000;          // 1 hour
-const MAX_FILE_SIZE        = 10 * 1024 * 1024;         // 10 MB
+
 
 const ALLOWED_TYPES = [
   "image/jpeg",
@@ -45,125 +45,7 @@ function buildFilePath({ schoolName, branchId, classId, sectionId, studentId, fi
   ].join("/");
 }
 
-/**
- * Uploads a single file buffer to GCS and returns a signed read URL.
- * Custom metadata is stored on the object so the OCR worker can identify
- * which student / class / exam the file belongs to without parsing the path.
- */
-async function uploadFileToGCS({ buffer, mimetype, filePath, meta }) {
-  const bucket  = storage.bucket(CENTRAL_BUCKET);
-  const gcsFile = bucket.file(filePath);
-
-  await new Promise((resolve, reject) => {
-    const stream = gcsFile.createWriteStream({
-      resumable: false,
-      contentType: mimetype,
-      metadata: {
-        contentDisposition: "inline",
-        // Custom metadata — readable by OCR / AI workers via object.getMetadata()
-        metadata: {
-          schoolName: meta.schoolName,
-          branchId:   meta.branchId || "default",
-          classId:    meta.classId,
-          sectionId:  meta.sectionId,
-          studentId:  meta.studentId,
-        },
-      },
-    });
-    stream.on("error", reject);
-    stream.on("finish", resolve);
-    stream.end(buffer);
-  });
-
-  const [signedUrl] = await gcsFile.getSignedUrl({
-    version: "v4",
-    action: "read",
-    expires: Date.now() + SIGNED_URL_EXPIRY_MS,
-  });
-
-  return { filePath, signedUrl };
-}
-
 // ─── Controllers ─────────────────────────────────────────────────────────────
-
-/**
- * POST /api/v1/upload
- * Accepts multipart files + metadata in req.body.
- * Stores each file under a structured path in the central bucket.
- */
-export async function processData(req, res) {
-  try {
-    if (!req.files?.length) {
-      return res.status(400).json({ success: false, message: "No files uploaded" });
-    }
-
-    const { schoolName, branchId, classId, sectionId, studentId } = req.body;
-
-    if (!schoolName || !classId || !sectionId || !studentId) {
-      return res.status(400).json({
-        success: false,
-        message: "schoolName, classId, sectionId, and studentId are required in form body",
-      });
-    }
-
-    // Validate every file before touching GCS
-    for (const file of req.files) {
-      if (!ALLOWED_TYPES.includes(file.mimetype)) {
-        return res.status(400).json({
-          success: false,
-          message: `Invalid file type: ${file.originalname}. Allowed: jpg, jpeg, png, pdf`,
-        });
-      }
-      if (file.size > MAX_FILE_SIZE) {
-        return res.status(400).json({
-          success: false,
-          message: `File too large: ${file.originalname}. Maximum size is 10 MB`,
-        });
-      }
-    }
-
-    const meta = { schoolName, branchId, classId, sectionId, studentId };
-
-    const uploadPromises = req.files.map((file) => {
-      const filePath = buildFilePath({
-        schoolName,
-        branchId,
-        classId,
-        sectionId,
-        studentId,
-        fileName: file.originalname,
-      });
-
-      return uploadFileToGCS({
-        buffer: file.buffer,
-        mimetype: file.mimetype,
-        filePath,
-        meta,
-      }).then((result) => ({ originalName: file.originalname, ...result }));
-    });
-
-    const settled = await Promise.allSettled(uploadPromises);
-
-    const uploaded = settled
-      .filter((r) => r.status === "fulfilled")
-      .map((r) => r.value);
-
-    const errors = settled
-      .filter((r) => r.status === "rejected")
-      .map((r) => r.reason?.message || "Unknown error");
-
-    return res.status(uploaded.length ? 200 : 500).json({
-      success: uploaded.length > 0,
-      message: `Uploaded ${uploaded.length} of ${req.files.length} files`,
-      uploaded,
-      ...(errors.length && { errors }),
-    });
-
-  } catch (error) {
-    console.error("Upload error:", error);
-    return res.status(500).json({ success: false, message: "Server error during upload" });
-  }
-}
 
 /**
  * POST /api/v1/generate-upload-url
@@ -174,7 +56,7 @@ export async function generateUploadUrl(req, res) {
   try {
     const { fileName, contentType, schoolName, branchId, classId, sectionId, studentId } =
       req.body;
-
+    const jobId = uuidv4();
     if (!fileName || !contentType || !schoolName || !classId || !sectionId || !studentId) {
       return res.status(400).json({
         success: false,
@@ -194,23 +76,92 @@ export async function generateUploadUrl(req, res) {
     const bucket = storage.bucket(CENTRAL_BUCKET);
     const file = bucket.file(filePath);
 
+     // ── Signed URL — metadata headers encode karo ─────────────────────────
+    // x-goog-meta-* headers signed URL mein lock ho jaate hain
+    // Frontend ko PUT request mein exactly yahi headers bhejne padte hain
     const [uploadUrl] = await file.getSignedUrl({
-      version: "v4",
-      action: "write",
-      expires: Date.now() + 15 * 60 * 1000, // 15 minutes to complete the upload
+      version:     'v4',
+      action:      'write',
+      expires:     Date.now() + 15 * 60 * 1000,
       contentType,
+      extensionHeaders: {
+        'x-goog-meta-jobid':      jobId,
+        'x-goog-meta-schoolname': schoolName || '',
+        'x-goog-meta-studentid':  studentId  || '',
+        'x-goog-meta-branchid':   branchId   || '',
+        'x-goog-meta-classid':    classId    || '',
+        'x-goog-meta-sectionid':  sectionId  || '',
+      },
+    });
+  // ── Step 3: Firestore mein job create karo ────────────────────────────
+    await firestore.collection('exam_jobs').doc(jobId).set({
+      jobId,
+      status:    'pending',
+      filePath,
+      createdAt: new Date().toISOString(),
+      student: {
+        schoolName: schoolName || null,
+        branchId:   branchId   || null,
+        classId:    classId    || null,
+        sectionId:  sectionId  || null,
+        studentId:  studentId  || null,
+      },
     });
 
     return res.json({
-      success: true,
+      success:    true,
       uploadUrl,
-      bucketName: CENTRAL_BUCKET,
       filePath,
-      expiresIn: "15 minutes",
+      jobId,
+      status:     'pending',
+      expiresIn:  '15 minutes',
+      requiredHeaders: {
+        'Content-Type':           contentType,
+        'x-goog-meta-jobid':      jobId,
+        'x-goog-meta-schoolname': schoolName || '',
+        'x-goog-meta-studentid':  studentId  || '',
+        'x-goog-meta-branchid':   branchId   || '',
+        'x-goog-meta-classid':    classId    || '',
+        'x-goog-meta-sectionid':  sectionId  || '',
+      },
     });
 
   } catch (error) {
     console.error("Generate upload URL error:", error);
     return res.status(500).json({ success: false, message: error.message });
   }
+}
+
+export async function giveStatus(req, res){
+
+  const { jobId } = req.params;
+
+  const doc = await firestore.collection('exam_jobs').doc(jobId).get();
+
+  if (!doc.exists) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+
+  const job = doc.data();
+
+  // Pending hai toh sirf status bhejo
+  if (job.status === 'pending' || job.status === 'processing') {
+    return res.json({ jobId, status: job.status });
+  }
+
+  // Completed hai toh result bhi bhejo
+  if (job.status === 'completed') {
+    return res.json({
+      jobId,
+      status:          'completed',
+      questionsFound:  job.questionsFound,
+      avgConfidence:   job.avgConfidence,
+      segmentedAnswers: job.segmentedAnswers,
+      processedAt:     job.processedAt,
+    });
+  }
+
+  // Failed
+  return res.json({ jobId, status: 'failed', error: job.error });
+
 }

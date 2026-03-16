@@ -182,8 +182,18 @@ async function handleMessage(message) {
 
   const student = data.student ?? ocrJson?.student ?? null;
 
+  // ── Invalid OCR JSON ──────────────────────────────────────────────────────
   if (!ocrJson?.text) {
     log.error('WORKER_INVALID_OCR_JSON', { messageId, ocrPath });
+
+  // Job failed mark kiya
+  if (data.jobId) {
+    await firestore.collection('exam_jobs').doc(data.jobId).update({
+      status: 'failed',
+      error:  'Invalid OCR JSON',
+    }).catch(() => {});  // non-fatal
+  }
+
     await markProcessedAndAck(ocrPath, message, { skippedReason: 'invalid_ocr_json' });
     return;
   }
@@ -338,6 +348,33 @@ async function handleMessage(message) {
   }
 
   log.info('FIRESTORE_WRITE_COMPLETE', { messageId, ocrPath });
+
+// jobId OCR JSON ke path se nikalo ya Pub/Sub message se pass karo
+// Firestore mein job status update karo
+// Ab yahan lagao — exam_answers save hone ke baad
+const jobId = data.jobId ?? null;
+
+if (jobId) {
+  try {
+    await withTimeout(
+      firestore.collection('exam_jobs').doc(jobId).update({
+        status:           'completed',
+        questionsFound:   segmentedAnswers?.questions?.length ?? 0,
+        avgConfidence:    ocrJson.avgConfidence  ?? null,
+        segmentedAnswers: segmentedAnswers,
+        processedAt:      new Date().toISOString(),
+        processingTimeMs: Date.now() - startedAt,
+      }),
+      10_000,
+      'Firestore exam_jobs update'
+    );
+    log.info('JOB_STATUS_UPDATED', { messageId, jobId, status: 'completed' });
+  } catch (err) {
+    log.warn('JOB_STATUS_UPDATE_FAILED', {
+      messageId, jobId, error: err.message,
+    });
+  }
+}
 
   try {
     await markProcessedAndAck(ocrPath, message, {

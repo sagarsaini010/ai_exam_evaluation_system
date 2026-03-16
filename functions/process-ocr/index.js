@@ -150,7 +150,7 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
     log.info('OCR_SKIP_ALREADY_PROCESSED', { bucket: bucketName, file: filePath });
     return;
   }
-
+  const jobId = customMetadata.jobid || null;
   log.info('OCR_PROCESS_START', { bucket: bucketName, file: filePath, mimeType });
 
   // ── Download ──────────────────────────────────────────────────────────────
@@ -223,6 +223,7 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
   const ocrPayload = {
     sourceFile:     filePath,
     bucket:         bucketName,
+    jobId:          jobId,
     text:           document.text || '',
     totalPages:     document.pages?.length || 0,
     avgConfidence:  avgConfidence,
@@ -246,6 +247,7 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
       metadata: {
         metadata: {
           ocrGenerated: 'true',
+          jobId,
           sourceFile:   filePath,
           // Propagate student context so downstream tools can read it from
           // the OCR file's own metadata without parsing the JSON body
@@ -277,6 +279,7 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
     bucket:      bucketName,
     ocrPath:     outputPath,
     sourceFile:  filePath,
+    jobId:       jobId,
     generatedAt: ocrPayload.generatedAt,
     student:     ocrPayload.student,   // AI grading worker needs this immediately
   };
