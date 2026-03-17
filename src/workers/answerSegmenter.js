@@ -1,26 +1,29 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import dotenv from "dotenv";
+import { VertexAI } from '@google-cloud/vertexai';
 
-dotenv.config();
+const PROJECT_ID = process.env.GCP_PROJECT_ID || 'secure-brook-470609-q7';
+const LOCATION   = 'asia-south1';               // your GCP region
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const vertexAI = new VertexAI({ project: PROJECT_ID, location: LOCATION });
 
-const model = genAI.getGenerativeModel({
-  model: "gemini-3.1-flash-lite-preview",
+// gemini-1.5-flash is available in asia-south1
+// gemini-3.1-flash-lite-preview is NOT available in asia-south1 — use 1.5-flash
+const model = vertexAI.getGenerativeModel({
+  model:             'gemini-3-flash-preview',
+  generationConfig:  { temperature: 0 },
 });
 
 /* ─── Retry config ────────────────────────────────────────────────────────── */
 const RETRY_CONFIG = {
   maxAttempts: 3,
   baseDelayMs: 1000,
-  maxDelayMs: 10000,
+  maxDelayMs:  10000,
 };
 
 /* ─── Timeout protection ─────────────────────────────────────────────────── */
-function withTimeout(promise, ms, label = "operation") {
+function withTimeout(promise, ms, label = 'operation') {
   const timeout = new Promise((_, reject) =>
     setTimeout(
-      () => reject(Object.assign(new Error(`Timeout: ${label} exceeded ${ms}ms`), { code: "ETIMEDOUT" })),
+      () => reject(Object.assign(new Error(`Timeout: ${label} exceeded ${ms}ms`), { code: 'ETIMEDOUT' })),
       ms
     )
   );
@@ -30,8 +33,8 @@ function withTimeout(promise, ms, label = "operation") {
 /* ─── Retryable error detection ──────────────────────────────────────────── */
 function isRetryable(err) {
   if (!err) return false;
-  if (["ETIMEDOUT", "ECONNRESET", "EAI_AGAIN"].includes(err.code)) return true;
-  if (err.message?.startsWith("Timeout:")) return true;
+  if (['ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN'].includes(err.code)) return true;
+  if (err.message?.startsWith('Timeout:')) return true;
   const status = err.status ?? err.response?.status;
   if (status === 429) return true;
   if (status >= 500)  return true;
@@ -47,24 +50,21 @@ function getBackoffDelay(attempt) {
   );
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /* ─── JSON extractor ─────────────────────────────────────────────────────── */
 function extractJSON(text) {
-  if (!text || typeof text !== "string") return null;
-
+  if (!text || typeof text !== 'string') return null;
   try {
     return JSON.parse(text.trim());
   } catch {
     try {
-      const start = text.indexOf("{");
-      const end   = text.lastIndexOf("}");
+      const start = text.indexOf('{');
+      const end   = text.lastIndexOf('}');
       if (start === -1 || end === -1 || end <= start) return null;
       return JSON.parse(text.substring(start, end + 1));
     } catch (err) {
-      console.error("JSON parse error:", err.message);
+      console.error('JSON parse error:', err.message);
       return null;
     }
   }
@@ -74,17 +74,16 @@ function extractJSON(text) {
 function isValidSegmentation(parsed) {
   return (
     parsed &&
-    typeof parsed === "object" &&
+    typeof parsed === 'object' &&
     Array.isArray(parsed.questions) &&
     parsed.questions.every(
-      (q) =>
-        typeof q.questionNumber === "string" &&
-        typeof q.answer         === "string"
+      q => typeof q.questionNumber === 'string' &&
+           typeof q.answer         === 'string'
     )
   );
 }
 
-/* ─── Core LLM call (single attempt) ─────────────────────────────────────── */
+/* ─── Core LLM call — Vertex AI SDK ──────────────────────────────────────── */
 async function callLLM(text) {
   const prompt = `
 You are an AI system that segments OCR text of handwritten exam answer sheets.
@@ -142,12 +141,12 @@ then the correct question numbers must be:
 
 QUESTION + ANSWER RULE
 
-If the OCR text contains both the **question statement and the answer**, then:
+If the OCR text contains both the question statement and the answer, then:
 
-• The question statement must be stored in "question"
-• The student response must be stored in "answer"
+- The question statement must be stored in "question"
+- The student response must be stored in "answer"
 
-The answer begins **after the question statement ends**.
+The answer begins after the question statement ends.
 
 --------------------------------
 
@@ -155,8 +154,8 @@ IF QUESTION TEXT IS NOT PRESENT
 
 If the answer sheet only contains the answer and not the question text:
 
-• Set "question": null
-• Extract the full answer normally.
+- Set "question": null
+- Extract the full answer normally.
 
 --------------------------------
 
@@ -166,11 +165,11 @@ IMPORTANT RULES
 2. DO NOT fix spelling.
 3. DO NOT correct grammar.
 4. DO NOT rewrite text.
-5. Preserve \n.
+5. Preserve \\n.
 6. If OCR text looks incorrect, keep it unchanged.
 7. Fix broken OCR words but DO NOT rewrite sentences.
 8. Only merge words that were split incorrectly.
-9. Don't do mistakes like broke words ex => "humani            ity, आ                                    आने, नैतिक                        क, p       practice"
+
 --------------------------------
 
 OUTPUT FORMAT (STRICT JSON)
@@ -189,11 +188,7 @@ OUTPUT FORMAT (STRICT JSON)
 
 IMPORTANT
 
-Return ONLY JSON.
-
-No explanation.
-No markdown.
-No extra text.
+Return ONLY JSON. No explanation. No markdown. No extra text.
 
 --------------------------------
 
@@ -201,27 +196,30 @@ OCR TEXT:
 ${text}
 `;
 
-  const result = await model.generateContent(prompt);
-  const raw = result.response.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  // Vertex AI SDK — different response shape from @google/generative-ai
+  const result = await model.generateContent({
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+  });
+
+  // Vertex AI response path
+  const raw = result.response.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
 
   if (!raw.trim()) {
-    const err = new Error("LLM returned empty response");
-    err.nonRetryable = true;
-    throw err;
+    throw Object.assign(new Error('LLM returned empty response'), { nonRetryable: true });
   }
 
   return raw;
 }
 
-/* ─── Main export with retry + timeout ───────────────────────────────────── */
+/* ─── Main export — unchanged logic, only SDK call changed ───────────────── */
 export async function segmentAnswersWithLLM(text) {
-  console.log("\n=========== ANSWER SEGMENTATION STARTED ===========");
+  console.log('\n=========== ANSWER SEGMENTATION STARTED ===========');
   console.log(`timestamp  : ${new Date().toISOString()}`);
   console.log(`inputLength: ${text?.length ?? 0} chars`);
-  console.log("====================================================\n");
+  console.log('====================================================\n');
 
-  if (!text || !text.trim()) {
-    console.warn("segmentAnswersWithLLM: empty text provided");
+  if (!text?.trim()) {
+    console.warn('segmentAnswersWithLLM: empty text provided');
     return { questions: [] };
   }
 
@@ -231,71 +229,43 @@ export async function segmentAnswersWithLLM(text) {
     try {
       if (attempt > 0) {
         const delay = getBackoffDelay(attempt - 1);
-        console.warn(
-          `segmentAnswersWithLLM: retry attempt ${attempt}/${RETRY_CONFIG.maxAttempts - 1} after ${Math.round(delay)}ms — ${lastError?.message}`
-        );
+        console.warn(`segmentAnswersWithLLM: retry ${attempt}/${RETRY_CONFIG.maxAttempts - 1} after ${Math.round(delay)}ms — ${lastError?.message}`);
         await sleep(delay);
       }
 
       console.log(`segmentAnswersWithLLM: calling Gemini (attempt ${attempt + 1})...`);
 
-      const raw = await withTimeout(
-        callLLM(text),
-        45_000,
-        "answer segmentation"
-      );
-
+      const raw    = await withTimeout(callLLM(text), 45_000, 'answer segmentation');
       const parsed = extractJSON(raw);
 
       if (!parsed) {
-        console.warn(`Attempt ${attempt + 1}: LLM returned non-JSON:\n${raw.slice(0, 200)}`);
-        lastError = new Error("LLM returned non-JSON");
-        lastError.nonRetryable = true;
+        console.warn(`Attempt ${attempt + 1}: non-JSON response:\n${raw.slice(0, 200)}`);
+        lastError = Object.assign(new Error('LLM returned non-JSON'), { nonRetryable: true });
         break;
       }
 
       if (!isValidSegmentation(parsed)) {
-        console.warn(
-          `Attempt ${attempt + 1}: JSON structure invalid:`,
-          JSON.stringify(parsed).slice(0, 200)
-        );
-        lastError = new Error("Invalid segmentation structure");
-        lastError.nonRetryable = true;
+        console.warn(`Attempt ${attempt + 1}: invalid structure:`, JSON.stringify(parsed).slice(0, 200));
+        lastError = Object.assign(new Error('Invalid segmentation structure'), { nonRetryable: true });
         break;
       }
 
-      if (attempt > 0) {
-        console.log(`segmentAnswersWithLLM: succeeded on attempt ${attempt + 1}`);
-      }
-
-      console.log("\n=========== ANSWER SEGMENTATION COMPLETE ===========");
+      console.log('\n=========== ANSWER SEGMENTATION COMPLETE ===========');
       console.log(`questionsFound: ${parsed.questions.length}`);
-      console.log("=====================================================\n");
+      console.log('=====================================================\n');
 
       return parsed;
 
     } catch (err) {
       lastError = err;
-
       if (err.nonRetryable || !isRetryable(err)) {
-        console.error(
-          `segmentAnswersWithLLM: non-retryable error on attempt ${attempt + 1}:`,
-          err.message
-        );
+        console.error(`segmentAnswersWithLLM: non-retryable on attempt ${attempt + 1}:`, err.message);
         break;
       }
-
-      console.warn(
-        `segmentAnswersWithLLM: retryable error on attempt ${attempt + 1}:`,
-        err.message,
-        err.status ? `(HTTP ${err.status})` : ""
-      );
+      console.warn(`segmentAnswersWithLLM: retryable on attempt ${attempt + 1}:`, err.message);
     }
   }
 
-  console.error(
-    "segmentAnswersWithLLM: all attempts failed, returning empty. Last error:",
-    lastError?.message
-  );
+  console.error('segmentAnswersWithLLM: all attempts failed. Last error:', lastError?.message);
   return { questions: [] };
 }

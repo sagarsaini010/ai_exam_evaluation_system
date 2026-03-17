@@ -1,26 +1,27 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import dotenv from "dotenv";
+import { VertexAI } from '@google-cloud/vertexai';
 
-dotenv.config();
+const PROJECT_ID = process.env.GCP_PROJECT_ID || 'secure-brook-470609-q7';
+const LOCATION   = 'asia-south1';
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const vertexAI = new VertexAI({ project: PROJECT_ID, location: LOCATION });
 
-const model = genAI.getGenerativeModel({
-  model: "gemini-3.1-flash-lite-preview",
+const model = vertexAI.getGenerativeModel({
+  model:            'gemini-3-flash-preview',
+  generationConfig: { temperature: 0 },
 });
 
 /* ─── Retry config ────────────────────────────────────────────────────────── */
 const RETRY_CONFIG = {
   maxAttempts: 3,
   baseDelayMs: 1000,
-  maxDelayMs: 10000,
+  maxDelayMs:  10000,
 };
 
 /* ─── Timeout protection ─────────────────────────────────────────────────── */
-function withTimeout(promise, ms, label = "operation") {
+function withTimeout(promise, ms, label = 'operation') {
   const timeout = new Promise((_, reject) =>
     setTimeout(
-      () => reject(Object.assign(new Error(`Timeout: ${label} exceeded ${ms}ms`), { code: "ETIMEDOUT" })),
+      () => reject(Object.assign(new Error(`Timeout: ${label} exceeded ${ms}ms`), { code: 'ETIMEDOUT' })),
       ms
     )
   );
@@ -30,8 +31,8 @@ function withTimeout(promise, ms, label = "operation") {
 /* ─── Retryable error detection ──────────────────────────────────────────── */
 function isRetryable(err) {
   if (!err) return false;
-  if (["ETIMEDOUT", "ECONNRESET", "EAI_AGAIN"].includes(err.code)) return true;
-  if (err.message?.startsWith("Timeout:")) return true;
+  if (['ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN'].includes(err.code)) return true;
+  if (err.message?.startsWith('Timeout:')) return true;
   const status = err.status ?? err.response?.status;
   if (status === 429) return true;
   if (status >= 500)  return true;
@@ -47,11 +48,9 @@ function getBackoffDelay(attempt) {
   );
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-/* ─── Core LLM call (single attempt) ─────────────────────────────────────── */
+/* ─── Core LLM call — Vertex AI SDK ──────────────────────────────────────── */
 async function callLLM(ocrText) {
   const prompt = `
 You are cleaning OCR text from a handwritten exam sheet.
@@ -80,32 +79,34 @@ OCR TEXT:
 ${ocrText}
 `;
 
-  const result = await model.generateContent(prompt);
-  const raw = result.response.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  // Vertex AI SDK response shape
+  const result = await model.generateContent({
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+  });
+
+  const raw = result.response.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
 
   if (!raw.trim()) {
-    const err = new Error("LLM returned empty response");
-    err.nonRetryable = true;
-    throw err;
+    throw Object.assign(new Error('LLM returned empty response'), { nonRetryable: true });
   }
 
   return raw;
 }
 
-/* ─── Main export with retry + timeout ───────────────────────────────────── */
+/* ─── Main export — logic unchanged, only SDK call migrated ──────────────── */
 export async function correctOCRText(ocrText) {
-  console.log("\n=========== OCR CORRECTION STARTED ===========");
+  console.log('\n=========== OCR CORRECTION STARTED ===========');
   console.log(`timestamp  : ${new Date().toISOString()}`);
   console.log(`inputLength: ${ocrText?.length ?? 0} chars`);
-  console.log("===============================================\n");
+  console.log('===============================================\n');
 
-  console.log("\n=========== OCR BEFORE LLM CORRECTION ===========\n");
+  console.log('\n=========== OCR BEFORE LLM CORRECTION ===========\n');
   console.log(ocrText);
-  console.log("\n==================================================\n");
+  console.log('\n==================================================\n');
 
-  if (!ocrText || !ocrText.trim()) {
-    console.warn("correctOCRText: empty text provided, skipping correction");
-    return ocrText ?? "";
+  if (!ocrText?.trim()) {
+    console.warn('correctOCRText: empty text provided, skipping correction');
+    return ocrText ?? '';
   }
 
   let lastError = null;
@@ -114,9 +115,7 @@ export async function correctOCRText(ocrText) {
     try {
       if (attempt > 0) {
         const delay = getBackoffDelay(attempt - 1);
-        console.warn(
-          `correctOCRText: retry attempt ${attempt}/${RETRY_CONFIG.maxAttempts - 1} after ${Math.round(delay)}ms — ${lastError?.message}`
-        );
+        console.warn(`correctOCRText: retry ${attempt}/${RETRY_CONFIG.maxAttempts - 1} after ${Math.round(delay)}ms — ${lastError?.message}`);
         await sleep(delay);
       }
 
@@ -125,20 +124,16 @@ export async function correctOCRText(ocrText) {
       const correctedText = await withTimeout(
         callLLM(ocrText),
         30_000,
-        "OCR correction"
+        'OCR correction'
       );
 
-      if (attempt > 0) {
-        console.log(`correctOCRText: succeeded on attempt ${attempt + 1}`);
-      }
-
-      console.log("\n=========== OCR AFTER LLM CORRECTION ===========\n");
+      console.log('\n=========== OCR AFTER LLM CORRECTION ===========\n');
       console.log(correctedText);
-      console.log("\n=================================================\n");
+      console.log('\n=================================================\n');
 
-      console.log("\n=========== OCR CORRECTION COMPLETE ===========");
+      console.log('\n=========== OCR CORRECTION COMPLETE ===========');
       console.log(`outputLength: ${correctedText.trim().length} chars`);
-      console.log("================================================\n");
+      console.log('================================================\n');
 
       return correctedText.trim();
 
@@ -146,24 +141,14 @@ export async function correctOCRText(ocrText) {
       lastError = err;
 
       if (err.nonRetryable || !isRetryable(err)) {
-        console.error(
-          `correctOCRText: non-retryable error on attempt ${attempt + 1}:`,
-          err.message
-        );
+        console.error(`correctOCRText: non-retryable on attempt ${attempt + 1}:`, err.message);
         break;
       }
 
-      console.warn(
-        `correctOCRText: retryable error on attempt ${attempt + 1}:`,
-        err.message,
-        err.status ? `(HTTP ${err.status})` : ""
-      );
+      console.warn(`correctOCRText: retryable on attempt ${attempt + 1}:`, err.message, err.status ? `(HTTP ${err.status})` : '');
     }
   }
 
-  console.error(
-    "correctOCRText: all attempts failed, returning original text. Last error:",
-    lastError?.message
-  );
+  console.error('correctOCRText: all attempts failed, returning original. Last error:', lastError?.message);
   return ocrText.trim();
 }
