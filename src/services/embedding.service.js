@@ -1,13 +1,10 @@
-import { PredictionServiceClient } from '@google-cloud/aiplatform';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import dotenv from "dotenv";
 
-const PROJECT_ID = process.env.GCP_PROJECT_ID || 'secure-brook-470609-q7';
-const LOCATION   = 'asia-south1';
-const MODEL      = 'text-multilingual-embedding-002';
-const ENDPOINT   = `projects/${PROJECT_ID}/locations/${LOCATION}/publishers/google/models/${MODEL}`;
+dotenv.config();
 
-const client = new PredictionServiceClient({
-  apiEndpoint: `${LOCATION}-aiplatform.googleapis.com`,
-});
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const embeddingModel = genAI.getGenerativeModel({apiKey: process.env.GEMINI_API_KEY, model: 'gemini-embedding-001'});
 
 const RETRY_CONFIG = { maxAttempts: 3, baseDelayMs: 2000, maxDelayMs: 15000 };
 
@@ -26,7 +23,6 @@ function isRetryable(err) {
   if (!err) return false;
   if (['ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN'].includes(err.code)) return true;
   if (err.message?.startsWith('Timeout:')) return true;
-  if (err.code === 8) return true;
   const status = err.status ?? err.response?.status;
   if (status === 429 || status >= 500) return true;
   return false;
@@ -40,6 +36,7 @@ const log = {
   error: (e, f = {}) => console.error(JSON.stringify({ severity: 'ERROR',   event: e, ts: new Date().toISOString(), ...f })),
 };
 
+// ─── Single embedding ─────────────────────────────────────────────────────────
 export async function generateEmbedding(text) {
   let lastError = null;
 
@@ -54,33 +51,16 @@ export async function generateEmbedding(text) {
         await sleep(delay);
       }
 
-      const [response] = await withTimeout(
-        client.predict({
-          endpoint:  ENDPOINT,
-          instances: [{
-            structValue: {
-              fields: {
-                content:   { stringValue: text },
-                task_type: { stringValue: 'RETRIEVAL_DOCUMENT' },
-              },
-            },
-          }],
-          parameters: {
-            structValue: {
-              fields: {
-                outputDimensionality: { numberValue: 768 },
-              },
-            },
-          },
+      const result = await withTimeout(
+        embeddingModel.embedContent({
+          content: { parts: [{ text }] },
+          taskType: 'RETRIEVAL_DOCUMENT',
         }),
         60_000,
         'embedding predict'
       );
 
-      const embedding = response.predictions[0].structValue
-        .fields.embeddings.structValue
-        .fields.values.listValue.values
-        .map(v => v.numberValue);
+      const embedding = result.embedding.values;
 
       log.info('EMBEDDING_SUCCESS', { dimensions: embedding.length });
       return embedding;
@@ -99,4 +79,54 @@ export async function generateEmbedding(text) {
     new Error(lastError?.message ?? 'Embedding failed'),
     { code: lastError?.code ?? 'EMBEDDING_FAILED' }
   );
+}
+
+// ─── Batch embeddings — production ready ──────────────────────────────────────
+// Ek saath sab nahi — batchSize ke groups mein, beech mein delay
+// Default: 10 ek saath, 500ms gap — 1500/min quota ke andar rehta hai
+export async function generateEmbeddingsBatch(texts, batchSize = 10, delayMs = 500) {
+  const results = [];
+  let failed = 0;
+
+  for (let i = 0; i < texts.length; i += batchSize) {
+    const batch      = texts.slice(i, i + batchSize);
+    const batchIndex = Math.floor(i / batchSize) + 1;
+    const totalBatches = Math.ceil(texts.length / batchSize);
+
+    log.info('EMBEDDING_BATCH_START', {
+      batchIndex,
+      totalBatches,
+      batchSize: batch.length,
+      totalTexts: texts.length,
+    });
+
+    const batchResults = await Promise.allSettled(
+      batch.map(text => generateEmbedding(text))
+    );
+
+    for (const result of batchResults) {
+      if (result.status === 'fulfilled') {
+        results.push({ success: true, embedding: result.value });
+      } else {
+        failed++;
+        results.push({ success: false, error: result.reason?.message });
+        log.error('EMBEDDING_BATCH_ITEM_FAILED', { error: result.reason?.message });
+      }
+    }
+
+    log.info('EMBEDDING_BATCH_COMPLETE', { batchIndex, totalBatches, failed });
+
+    // Last batch ke baad delay mat lagao
+    if (i + batchSize < texts.length) {
+      await sleep(delayMs);
+    }
+  }
+
+  log.info('EMBEDDING_ALL_COMPLETE', {
+    total:     texts.length,
+    succeeded: texts.length - failed,
+    failed,
+  });
+
+  return results;
 }

@@ -1,14 +1,14 @@
-import { VertexAI } from '@google-cloud/vertexai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import dotenv from "dotenv";
 
-const PROJECT_ID = process.env.GCP_PROJECT_ID || 'secure-brook-470609-q7';
-const LOCATION   = 'asia-south1';
+dotenv.config();
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-const vertexAI = new VertexAI({ project: PROJECT_ID, location: LOCATION });
-
-const model = vertexAI.getGenerativeModel({
-  model:            'gemini-3-flash-preview',
+const model = genAI.getGenerativeModel({
+  model: 'gemini-3.1-flash-lite-preview',
   generationConfig: { temperature: 0 },
 });
+
 
 /* ─── Retry config ────────────────────────────────────────────────────────── */
 const RETRY_CONFIG = {
@@ -53,29 +53,56 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 /* ─── Core LLM call — Vertex AI SDK ──────────────────────────────────────── */
 async function callLLM(ocrText) {
   const prompt = `
-You are cleaning OCR text from a handwritten exam sheet.
+You are an OCR post-processing engine.
 
-Your task is ONLY to fix obvious OCR noise.
+Your ONLY task is to clean and normalize OCR text.
+You are NOT allowed to think, solve, interpret, or improve answers.
 
-Allowed fixes:
-- join broken words
-- remove random OCR characters
-- fix spacing
-- fix math symbols (π, √, sin, cos etc)
-- fix obvious spelling errors
+==================== RULES (STRICT) ====================
 
-STRICT RULES:
+1. DO NOT solve any question
+2. DO NOT add missing steps or explanations
+3. DO NOT infer meaning
+4. DO NOT complete incomplete sentences
+5. DO NOT modify numerical values
+6. DO NOT change formulas or equations
+7. DO NOT merge or split answers logically
+8. DO NOT remove repetitions unless clearly OCR noise
+9. DO NOT improve grammar beyond obvious OCR mistakes
+10. DO NOT rewrite in your own words
 
-1. DO NOT change numbers.
-2. DO NOT change mathematical expressions.
-3. DO NOT guess missing characters.
-4. If uncertain, keep the original text.
+========================================================
 
-Preserve all Hindi text exactly.
+✅ YOU ARE ONLY ALLOWED TO:
+- Fix spelling errors caused by OCR
+- Fix broken words (e.g., "ferti lisation" → "fertilisation")
+- Normalize symbols (e.g., "3x108" → "3×10^8")
+- Preserve original structure
+- Preserve line breaks
+- Preserve numbering EXACTLY as written
+
+========================================================
+
+⚠️ IMPORTANT EDGE CASES:
+
+- If text is unclear → KEEP IT AS IS
+- If something looks wrong → DO NOT FIX IT
+- If math seems incorrect → DO NOT CORRECT
+- If answer is incomplete → KEEP IT INCOMPLETE
+- If duplicate question numbers exist → KEEP THEM
+
+========================================================
+
+OUTPUT FORMAT:
 
 Return ONLY cleaned text.
+Do NOT return JSON.
+Do NOT add explanation.
+Do NOT add headings.
 
-OCR TEXT:
+========================================================
+
+INPUT TEXT:
 ${ocrText}
 `;
 

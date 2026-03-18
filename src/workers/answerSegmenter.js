@@ -1,16 +1,17 @@
-import { VertexAI } from '@google-cloud/vertexai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import dotenv from "dotenv";
 
-const PROJECT_ID = process.env.GCP_PROJECT_ID || 'secure-brook-470609-q7';
-const LOCATION   = 'asia-south1';               // your GCP region
+dotenv.config();
 
-const vertexAI = new VertexAI({ project: PROJECT_ID, location: LOCATION });
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({
+  model: 'gemini-3.1-flash-lite-preview',
+  generationConfig:  { temperature: 0 },
+});
 
 // gemini-1.5-flash is available in asia-south1
 // gemini-3.1-flash-lite-preview is NOT available in asia-south1 — use 1.5-flash
-const model = vertexAI.getGenerativeModel({
-  model:             'gemini-3-flash-preview',
-  generationConfig:  { temperature: 0 },
-});
+
 
 /* ─── Retry config ────────────────────────────────────────────────────────── */
 const RETRY_CONFIG = {
@@ -72,17 +73,16 @@ function extractJSON(text) {
 
 /* ─── Validate parsed structure ──────────────────────────────────────────── */
 function isValidSegmentation(parsed) {
-  return (
-    parsed &&
-    typeof parsed === 'object' &&
-    Array.isArray(parsed.questions) &&
-    parsed.questions.every(
-      q => typeof q.questionNumber === 'string' &&
-           typeof q.answer         === 'string'
-    )
+  if (!parsed || typeof parsed !== 'object') return false;
+  if (!Array.isArray(parsed.questions)) return false;
+  if (parsed.questions.length === 0) return true; // empty array bhi valid hai
+
+  return parsed.questions.every(q =>
+    typeof q.questionNumber === 'string' &&
+    typeof q.answer === 'string' &&        // answer string hona chahiye
+    (q.question === null || typeof q.question === 'string')  // question null bhi ho sakta hai
   );
 }
-
 /* ─── Core LLM call — Vertex AI SDK ──────────────────────────────────────── */
 async function callLLM(text) {
   const prompt = `
@@ -161,14 +161,16 @@ If the answer sheet only contains the answer and not the question text:
 
 IMPORTANT RULES
 
-1. DO NOT change OCR text.
-2. DO NOT fix spelling.
-3. DO NOT correct grammar.
-4. DO NOT rewrite text.
-5. Preserve \\n.
-6. If OCR text looks incorrect, keep it unchanged.
-7. Fix broken OCR words but DO NOT rewrite sentences.
-8. Only merge words that were split incorrectly.
+1. DO NOT solve any question
+2. DO NOT add missing steps or explanations
+3. DO NOT infer meaning
+4. DO NOT complete incomplete sentences
+5. DO NOT modify numerical values
+6. DO NOT change formulas or equations
+7. DO NOT merge or split answers logically
+8. DO NOT remove repetitions unless clearly OCR noise
+9. DO NOT improve grammar beyond obvious OCR mistakes
+10. DO NOT rewrite in your own words
 
 --------------------------------
 
@@ -196,15 +198,12 @@ OCR TEXT:
 ${text}
 `;
 
-  // Vertex AI SDK — different response shape from @google/generative-ai
-  const result = await model.generateContent({
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-  });
+const result = await model.generateContent(prompt);
 
-  // Vertex AI response path
-  const raw = result.response.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+  // @google/generative-ai ka sahi response path
+  const raw = result.response.text();
 
-  if (!raw.trim()) {
+  if (!raw?.trim()) {
     throw Object.assign(new Error('LLM returned empty response'), { nonRetryable: true });
   }
 
