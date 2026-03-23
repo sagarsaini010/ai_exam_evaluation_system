@@ -9,9 +9,6 @@ const model = genAI.getGenerativeModel({
   generationConfig:  { temperature: 0 },
 });
 
-// gemini-1.5-flash is available in asia-south1
-// gemini-3.1-flash-lite-preview is NOT available in asia-south1 — use 1.5-flash
-
 
 /* ─── Retry config ────────────────────────────────────────────────────────── */
 const RETRY_CONFIG = {

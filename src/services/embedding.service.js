@@ -37,7 +37,7 @@ const log = {
 };
 
 // ─── Single embedding ─────────────────────────────────────────────────────────
-export async function generateEmbedding(text) {
+export async function generateEmbedding(text, taskType = 'RETRIEVAL_DOCUMENT') {
   let lastError = null;
 
   for (let attempt = 0; attempt < RETRY_CONFIG.maxAttempts; attempt++) {

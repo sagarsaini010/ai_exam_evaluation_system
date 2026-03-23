@@ -230,6 +230,8 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
     pageConfidence: pageConfidences,
     pages:          layoutPages,
     generatedAt:    new Date().toISOString(),
+    examId:         customMetadata.examid    || null,   // ← add
+    subjectId:      customMetadata.subjectid || null,   // ← add
     // Student context — written by upload API, forwarded here for the AI pipeline
     student: {
       schoolName: customMetadata.schoolname || null,
@@ -280,6 +282,8 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
     ocrPath:     outputPath,
     sourceFile:  filePath,
     jobId:       jobId,
+    examId:      customMetadata.examid    || null,   // ← add
+    subjectId:   customMetadata.subjectid || null,   // ← add
     generatedAt: ocrPayload.generatedAt,
     student:     ocrPayload.student,   // AI grading worker needs this immediately
   };

@@ -4,6 +4,7 @@ import { Firestore } from '@google-cloud/firestore';
 import dotenv        from 'dotenv';
 import { correctOCRText }        from "./ocrCorrector.js";
 import { segmentAnswersWithLLM } from "./answerSegmenter.js";
+import { gradeAllAnswers } from '../services/grading.service.js';
 
 dotenv.config();
 
@@ -185,15 +186,12 @@ async function handleMessage(message) {
   // ── Invalid OCR JSON ──────────────────────────────────────────────────────
   if (!ocrJson?.text) {
     log.error('WORKER_INVALID_OCR_JSON', { messageId, ocrPath });
-
-  // Job failed mark kiya
-  if (data.jobId) {
-    await firestore.collection('exam_jobs').doc(data.jobId).update({
-      status: 'failed',
-      error:  'Invalid OCR JSON',
-    }).catch(() => {});  // non-fatal
-  }
-
+    if (data.jobId) {
+      await firestore.collection('exam_jobs').doc(data.jobId).update({
+        status: 'failed',
+        error:  'Invalid OCR JSON',
+      }).catch(() => {});
+    }
     await markProcessedAndAck(ocrPath, message, { skippedReason: 'invalid_ocr_json' });
     return;
   }
@@ -211,7 +209,6 @@ async function handleMessage(message) {
   // ── Layout pages ──────────────────────────────────────────────────────────
   const layoutPages = ocrJson.pages || [];
 
-  // ── Layout print karo — GCP Logs mein dikh jayega ────────────────────────
   log.info('WORKER_LAYOUT_PAGES', {
     messageId,
     ocrPath,
@@ -220,8 +217,8 @@ async function handleMessage(message) {
       page:       p.page,
       confidence: p.confidence,
       lineCount:  p.lines?.length ?? 0,
-      firstLine:  p.lines?.[0]                        ?? null,
-      lastLine:   p.lines?.[p.lines.length - 1]       ?? null,
+      firstLine:  p.lines?.[0]                  ?? null,
+      lastLine:   p.lines?.[p.lines.length - 1] ?? null,
     })),
   });
 
@@ -236,8 +233,6 @@ async function handleMessage(message) {
   });
 
   // ── Layout text banao LLM ke liye ─────────────────────────────────────────
-  // Agar layout pages available hain toh layout-aware text use karo,
-  // warna fallback cleanedText pe
   const llmInputText = layoutPages.length > 0
     ? layoutToLLMText(layoutPages)
     : cleanedText;
@@ -245,7 +240,7 @@ async function handleMessage(message) {
   log.info('WORKER_LLM_INPUT_READY', {
     messageId,
     ocrPath,
-    source:     layoutPages.length > 0 ? 'layout_pages' : 'cleaned_text',
+    source:      layoutPages.length > 0 ? 'layout_pages' : 'cleaned_text',
     inputLength: llmInputText.length,
   });
 
@@ -320,16 +315,16 @@ async function handleMessage(message) {
       firestore.collection('exam_answers').doc(docId(ocrPath)).set({
         ocrPath,
         bucket,
-        student:          student ?? null,
+        student:          student          ?? null,
         rawText,
         cleanedText,
-        llmInputText,                              // layout-aware text jo LLM ko diya
+        llmInputText,
         correctedText,
         segmentedAnswers,
         totalPages:       ocrJson.totalPages    ?? null,
         avgConfidence:    ocrJson.avgConfidence  ?? null,
         pageConfidence:   ocrJson.pageConfidence ?? null,
-        pages:            layoutPages,             // full layout pages Firestore mein
+        pages:            layoutPages,
         processedAt:      new Date().toISOString(),
         processingTimeMs: Date.now() - startedAt,
       }),
@@ -349,33 +344,136 @@ async function handleMessage(message) {
 
   log.info('FIRESTORE_WRITE_COMPLETE', { messageId, ocrPath });
 
-// jobId OCR JSON ke path se nikalo ya Pub/Sub message se pass karo
-// Firestore mein job status update karo
-// Ab yahan lagao — exam_answers save hone ke baad
-const jobId = data.jobId ?? null;
+  // ── Extract examId + subjectId ────────────────────────────────────────────
+  // data (Pub/Sub message) ya ocrJson ke metadata se lo
+  const jobId     = data.jobId     ?? null;
+  const examId    = data.examId    ?? ocrJson?.examId    ?? null;
+  const subjectId = data.subjectId ?? ocrJson?.subjectId ?? null;
 
-if (jobId) {
-  try {
-    await withTimeout(
-      firestore.collection('exam_jobs').doc(jobId).update({
-        status:           'completed',
-        questionsFound:   segmentedAnswers?.questions?.length ?? 0,
-        avgConfidence:    ocrJson.avgConfidence  ?? null,
-        segmentedAnswers: segmentedAnswers,
-        processedAt:      new Date().toISOString(),
-        processingTimeMs: Date.now() - startedAt,
-      }),
-      10_000,
-      'Firestore exam_jobs update'
-    );
-    log.info('JOB_STATUS_UPDATED', { messageId, jobId, status: 'completed' });
-  } catch (err) {
-    log.warn('JOB_STATUS_UPDATE_FAILED', {
-      messageId, jobId, error: err.message,
+  // ── Grading pipeline ──────────────────────────────────────────────────────
+  if (examId && subjectId && segmentedAnswers?.questions?.length > 0) {
+    try {
+      log.info('GRADING_PIPELINE_START', {
+        messageId, jobId, examId, subjectId,
+        questionsToGrade: segmentedAnswers.questions.length,
+      });
+
+      // Job status → grading
+      if (jobId) {
+        await firestore.collection('exam_jobs').doc(jobId).update({
+          status: 'grading',
+        }).catch(err => log.warn('JOB_STATUS_GRADING_UPDATE_FAILED', { jobId, error: err.message }));
+      }
+
+      const gradingResult = await gradeAllAnswers(
+        segmentedAnswers.questions,
+        examId,
+        subjectId,
+        student,
+        jobId
+      );
+
+      // exam_results collection mein save karo
+      const resultDocId = `${student?.studentId ?? 'unknown'}_${examId}_${subjectId}`;
+
+      await withTimeout(
+        firestore.collection('exam_results').doc(resultDocId).set({
+          ...gradingResult,
+          ocrPath,
+          bucket,
+        }),
+        15_000,
+        'Firestore exam_results write'
+      );
+
+      log.info('EXAM_RESULTS_SAVED', { messageId, jobId, resultDocId });
+
+      // exam_jobs → completed with grading data
+      if (jobId) {
+        await withTimeout(
+          firestore.collection('exam_jobs').doc(jobId).update({
+            status:           'completed',
+            questionsFound:   segmentedAnswers?.questions?.length ?? 0,
+            avgConfidence:    ocrJson.avgConfidence  ?? null,
+            segmentedAnswers: segmentedAnswers,
+            // Grading fields
+            gradingStatus:    gradingResult.gradingStatus,
+            totalMarks:       gradingResult.totalMarks,
+            maxMarks:         gradingResult.maxMarks,
+            percentage:       gradingResult.percentage,
+            flaggedQuestions: gradingResult.flaggedQuestions,
+            gradedAnswers:    gradingResult.gradedAnswers,
+            gradedAt:         gradingResult.gradedAt,
+            processedAt:      new Date().toISOString(),
+            processingTimeMs: Date.now() - startedAt,
+          }),
+          10_000,
+          'Firestore exam_jobs grading update'
+        );
+        log.info('JOB_STATUS_UPDATED', { messageId, jobId, status: 'completed' });
+      }
+
+      log.info('GRADING_PIPELINE_COMPLETE', {
+        messageId,
+        jobId,
+        gradingStatus: gradingResult.gradingStatus,
+        totalMarks:    gradingResult.totalMarks,
+        maxMarks:      gradingResult.maxMarks,
+        percentage:    gradingResult.percentage,
+        flaggedCount:  gradingResult.flaggedQuestions?.length ?? 0,
+      });
+
+    } catch (err) {
+      log.error('GRADING_PIPELINE_FAILED', {
+        messageId, jobId, error: err.message, code: err.code,
+      });
+
+      // Grading fail hone pe bhi job complete mark karo
+      // OCR + segmentation successful the — sirf grading fail hui
+      if (jobId) {
+        await firestore.collection('exam_jobs').doc(jobId).update({
+          status:           'completed',
+          questionsFound:   segmentedAnswers?.questions?.length ?? 0,
+          avgConfidence:    ocrJson.avgConfidence ?? null,
+          segmentedAnswers: segmentedAnswers,
+          gradingStatus:    'failed',
+          gradingError:     err.message,
+          processedAt:      new Date().toISOString(),
+          processingTimeMs: Date.now() - startedAt,
+        }).catch(() => {});
+      }
+    }
+
+  } else {
+    // Grading skip — examId ya subjectId nahi mila
+    log.warn('GRADING_SKIPPED', {
+      messageId,
+      jobId,
+      reason: !examId
+        ? 'no_examId_in_message'
+        : !subjectId
+        ? 'no_subjectId_in_message'
+        : 'no_questions_found',
     });
-  }
-}
 
+    // Job complete mark karo without grading
+    if (jobId) {
+      await withTimeout(
+        firestore.collection('exam_jobs').doc(jobId).update({
+          status:           'completed',
+          questionsFound:   segmentedAnswers?.questions?.length ?? 0,
+          avgConfidence:    ocrJson.avgConfidence  ?? null,
+          segmentedAnswers: segmentedAnswers,
+          processedAt:      new Date().toISOString(),
+          processingTimeMs: Date.now() - startedAt,
+        }),
+        10_000,
+        'Firestore exam_jobs update'
+      ).catch(err => log.warn('JOB_STATUS_UPDATE_FAILED', { messageId, jobId, error: err.message }));
+    }
+  }
+
+  // ── Mark processed + ack ──────────────────────────────────────────────────
   try {
     await markProcessedAndAck(ocrPath, message, {
       student:          student ?? null,
@@ -387,7 +485,7 @@ if (jobId) {
       messageId,
       ocrPath,
       error: err.message,
-      note:  'Results saved to exam_answers but idempotency record may be missing',
+      note:  'Results saved but idempotency record may be missing',
     });
     throw err;
   }

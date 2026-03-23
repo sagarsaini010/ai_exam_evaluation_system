@@ -54,13 +54,13 @@ function buildFilePath({ schoolName, branchId, classId, sectionId, studentId, fi
  */
 export async function generateUploadUrl(req, res) {
   try {
-    const { fileName, contentType, schoolName, branchId, classId, sectionId, studentId } =
+    const { fileName, contentType, schoolName, branchId, classId, sectionId, studentId, examId, subjectId} =
       req.body;
     const jobId = uuidv4();
-    if (!fileName || !contentType || !schoolName || !classId || !sectionId || !studentId) {
+    if (!fileName || !contentType || !schoolName || !classId || !sectionId || !studentId || !examId || !subjectId) {
       return res.status(400).json({
         success: false,
-        message: "fileName, contentType, schoolName, classId, sectionId, and studentId are required",
+        message: "fileName, contentType, schoolName, classId, sectionId, examId, subjectId and studentId are required",
       });
     }
 
@@ -91,6 +91,8 @@ export async function generateUploadUrl(req, res) {
         'x-goog-meta-branchid':   branchId   || '',
         'x-goog-meta-classid':    classId    || '',
         'x-goog-meta-sectionid':  sectionId  || '',
+        'x-goog-meta-examid':     examId    || '',   // ← add
+        'x-goog-meta-subjectid':  subjectId || '',   // ← add
       },
     });
   // ── Step 3: Firestore mein job create karo ────────────────────────────
@@ -98,7 +100,9 @@ export async function generateUploadUrl(req, res) {
       jobId,
       status:    'pending',
       filePath,
-      createdAt: new Date().toISOString(),
+      createdAt:    new Date().toISOString(),
+      examId:       examId        || null,   // ← add
+      subjectId:    subjectId     || null,   // ← add
       student: {
         schoolName: schoolName || null,
         branchId:   branchId   || null,
@@ -123,6 +127,8 @@ export async function generateUploadUrl(req, res) {
         'x-goog-meta-branchid':   branchId   || '',
         'x-goog-meta-classid':    classId    || '',
         'x-goog-meta-sectionid':  sectionId  || '',
+        'x-goog-meta-examid':     examId     || '',   // ← add
+        'x-goog-meta-subjectid':  subjectId  || '',   // ← add
       },
     });
 
@@ -158,8 +164,24 @@ export async function giveStatus(req, res){
       avgConfidence:   job.avgConfidence,
       segmentedAnswers: job.segmentedAnswers,
       processedAt:     job.processedAt,
+      // Grading results — agar available hai
+      gradingStatus:    job.gradingStatus    ?? null,
+      totalMarks:       job.totalMarks       ?? null,
+      maxMarks:         job.maxMarks         ?? null,
+      percentage:       job.percentage       ?? null,
+      flaggedQuestions: job.flaggedQuestions ?? [],
+      gradedAnswers:    job.gradedAnswers    ?? [],
+      gradedAt:         job.gradedAt        ?? null,
     });
   }
+  // Grading chal raha hai
+if (job.status === 'grading') {
+  return res.json({
+    jobId,
+    status:  'grading',
+    message: 'AI is grading your answers...',
+  });
+}
 
   // Failed
   return res.json({ jobId, status: 'failed', error: job.error });
