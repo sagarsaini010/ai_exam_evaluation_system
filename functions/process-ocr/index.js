@@ -1,17 +1,22 @@
-const path = require('path');
+'use strict';
+
+const path      = require('path');
 const functions = require('@google-cloud/functions-framework');
-const { DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1;
-const { Storage } = require('@google-cloud/storage');
-const { PubSub } = require('@google-cloud/pubsub');
+const { Storage }   = require('@google-cloud/storage');
+const { PubSub }    = require('@google-cloud/pubsub');
+const { Firestore } = require('@google-cloud/firestore');
+
+const { runInlineOcr }                           = require('./inlineOcr');
+const { submitBatchOcr, buildBatchOutputPrefix } = require('./batchOcr');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const TOPIC_NAME   = process.env.OCR_TOPIC                || 'exam-ocr-completed';
-const projectId    = process.env.GCP_PROJECT_ID           || 'secure-brook-470609-q7';
-const location     = process.env.DOCUMENT_AI_LOCATION     || 'asia-south1';
-const processorId  = process.env.DOCUMENT_AI_PROCESSOR_ID || 'f9b5a9f31d819f11';
+const TOPIC_NAME = process.env.OCR_TOPIC     || 'exam-ocr-completed';
+const projectId  = process.env.GCP_PROJECT_ID || 'secure-brook-470609-q7';
 
-// Document AI inline limit is 20 MB — stay safely under it
-const MAX_FILE_BYTES = 18 * 1024 * 1024;
+// 15 pages tak inline — uske upar batch
+// Inline limit: ~15 pages / ~18MB whichever comes first
+const INLINE_PAGE_LIMIT = parseInt(process.env.INLINE_PAGE_LIMIT || '15', 10);
+const MAX_FILE_BYTES    = 18 * 1024 * 1024;
 
 const MIME_TYPES = {
   pdf:  'application/pdf',
@@ -20,117 +25,114 @@ const MIME_TYPES = {
   png:  'image/png',
 };
 
-// ─── Structured logger ────────────────────────────────────────────────────────
-// Cloud Logging parses JSON lines automatically — filter by event/severity/file
-// in the GCP console instead of grepping free-text strings.
+// ─── Clients ──────────────────────────────────────────────────────────────────
+const storage   = new Storage();
+const pubsub    = new PubSub();
+const firestore = new Firestore({ projectId });
+
+// ─── Logger ───────────────────────────────────────────────────────────────────
 const log = {
-  info:  (event, fields = {}) => console.log(JSON.stringify({ severity: 'INFO',    event, ...fields })),
-  warn:  (event, fields = {}) => console.warn(JSON.stringify({ severity: 'WARNING', event, ...fields })),
-  error: (event, fields = {}) => console.error(JSON.stringify({ severity: 'ERROR',  event, ...fields })),
+  info:  (event, fields = {}) => console.log  (JSON.stringify({ severity: 'INFO',    event, ...fields })),
+  warn:  (event, fields = {}) => console.warn (JSON.stringify({ severity: 'WARNING', event, ...fields })),
+  error: (event, fields = {}) => console.error(JSON.stringify({ severity: 'ERROR',   event, ...fields })),
 };
 
-// ─── Clients (ADC — no key file needed on Cloud Run / GCF) ───────────────────
-const docAIClient = new DocumentProcessorServiceClient({
-  apiEndpoint: `${location}-documentai.googleapis.com`,
-});
-const storage = new Storage();
-const pubsub   = new PubSub();
-
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/**
- * Derives the OCR output path from the source file path.
- * e.g. school/branch/class/section/student/123-answer.pdf
- *   →  school/branch/class/section/student/123-answer-ocr.json
- */
 function buildOcrOutputPath(filePath) {
-  const dir  = path.posix.dirname(filePath);   // never '.' for structured uploads
+  const dir  = path.posix.dirname(filePath);
   const base = path.posix.basename(filePath, path.posix.extname(filePath));
   return `${dir}/${base}-ocr.json`;
 }
 
-/**
- * Document AI response se layout-aware pages banata hai.
- * Har page mein lines aur page-level average confidence hoti hai.
- */
-function extractLayoutPages(document) {
-  if (!document.pages || document.pages.length === 0) return [];
-
-  const fullText = document.text || '';
-
-  return document.pages.map((page) => {
-    const pageNumber = page.pageNumber ?? 1;
-
-    // ── Lines extract karo ──────────────────────────────────────
-    const lines = (page.lines || []).map((line) => {
-      const segments = line.layout?.textAnchor?.textSegments || [];
-      const lineText = segments
-        .map((seg) => {
-          const start = Number(seg.startIndex || 0);
-          const end   = Number(seg.endIndex   || 0);
-          return fullText.slice(start, end);
-        })
-        .join('')
-        .replace(/\n$/, '')   // trailing newline hatao
-        .trim();
-      return lineText;
-    }).filter(line => line.length > 0);   // empty lines hatao
-
-    // ── Page confidence — token-level average ───────────────────
-    const tokens = page.tokens || [];
-    let pageConfidence = null;
-
-    if (tokens.length > 0) {
-      const sum = tokens.reduce(
-        (acc, t) => acc + (t.layout?.confidence ?? 0), 0
-      );
-      pageConfidence = Number((sum / tokens.length).toFixed(4));
-    }
-
-    return {
-      page:       pageNumber,
-      confidence: pageConfidence,
-      lines,
-    };
-  });
-}
-
-/**
- * Returns true if this GCS event should be ignored:
- * - Already an OCR output file
- * - Already processed (flag written by this function)
- */
 function shouldSkipFile(filePath, customMetadata = {}) {
   if (!filePath)                              return true;
   if (filePath.endsWith('-ocr.json'))         return true;
+  if (filePath.startsWith('ocr-batch-output')) return true;  // batch output ignore karo
   if (customMetadata.ocrGenerated === 'true') return true;
   return false;
 }
 
-/**
- * Fetches the GCS object's custom metadata explicitly.
- * GCS event payloads do NOT reliably include custom metadata,
- * so we always do a separate getMetadata() call.
- */
 async function getFileMetadata(bucketName, filePath) {
   const [meta] = await storage.bucket(bucketName).file(filePath).getMetadata();
-  return meta?.metadata || {};   // custom metadata lives under .metadata
+  return meta?.metadata || {};
+}
+
+async function markJobFailed(jobId, reason) {
+  if (!jobId) return;
+  try {
+    await firestore.collection('exam_jobs').doc(jobId).update({
+      status:   'failed',
+      error:    reason,
+      failedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    log.warn('JOB_STATUS_UPDATE_FAILED', { jobId, reason, error: err.message });
+  }
+}
+
+/**
+ * PDF ka page count sirf header bytes padhke nikalta hai.
+ * Full download avoid karta hai — fast aur cheap.
+ */
+async function getPdfPageCount(bucketName, filePath) {
+  try {
+    // PDF spec: page count /Count keyword ke baad hota hai
+    // Sirf first 32KB padhte hain — almost always enough
+    const [partialBuffer] = await storage
+      .bucket(bucketName)
+      .file(filePath)
+      .download({ start: 0, end: 32767 });
+
+    const text = partialBuffer.toString('latin1');
+
+    // /Count N pattern dhundo — last match lena (nested pages ke liye)
+    const matches = [...text.matchAll(/\/Count\s+(\d+)/g)];
+    if (matches.length > 0) {
+      const count = parseInt(matches[matches.length - 1][1], 10);
+      if (count > 0 && count < 10000) return count;
+    }
+
+    // Fallback — count nahi mila, batch use karo (safe side)
+    log.warn('PDF_PAGE_COUNT_FALLBACK', { bucketName, filePath, reason: 'Count not found in first 32KB' });
+    return 999;
+
+  } catch (err) {
+    log.warn('PDF_PAGE_COUNT_ERROR', { bucketName, filePath, error: err.message });
+    return 999; // Error pe bhi batch safe hai
+  }
+}
+
+async function publishToPubSub(message, filePath, bucketName) {
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      await pubsub
+        .topic(TOPIC_NAME)
+        .publishMessage({ data: Buffer.from(JSON.stringify(message)) });
+      return true;
+    } catch (err) {
+      log.warn('OCR_PUBSUB_PUBLISH_FAILED', {
+        file: filePath, attempt, maxAttempts: MAX_ATTEMPTS, error: err.message,
+      });
+      if (attempt < MAX_ATTEMPTS) {
+        await new Promise(r => setTimeout(r, 500 * attempt));
+      }
+    }
+  }
+  return false;
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────────
-
 functions.cloudEvent('processOCR', async (cloudEvent) => {
   const fileData   = cloudEvent.data || {};
   const bucketName = fileData.bucket;
   const filePath   = fileData.name;
 
-  // Basic guards
   if (!bucketName || !filePath) {
     log.warn('OCR_SKIP_INVALID_EVENT', { reason: 'missing bucket or file name' });
     return;
   }
 
-  // Check extension early — avoids a GCS fetch for unsupported files
   const extension = filePath.split('.').pop().toLowerCase();
   const mimeType  = MIME_TYPES[extension];
   if (!mimeType) {
@@ -138,7 +140,6 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
     return;
   }
 
-  // Fetch real custom metadata from GCS (event payload is not reliable)
   let customMetadata = {};
   try {
     customMetadata = await getFileMetadata(bucketName, filePath);
@@ -150,98 +151,127 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
     log.info('OCR_SKIP_ALREADY_PROCESSED', { bucket: bucketName, file: filePath });
     return;
   }
-  const jobId = customMetadata.jobid || null;
-  log.info('OCR_PROCESS_START', { bucket: bucketName, file: filePath, mimeType });
 
-  // ── Download ──────────────────────────────────────────────────────────────
+  const jobId = customMetadata.jobid || null;
+
+  log.info('OCR_PROCESS_START', { bucket: bucketName, file: filePath, mimeType, jobId });
+
+  // ── Image files — inline only (page count irrelevant) ─────────────────────
+  if (extension !== 'pdf') {
+    await handleInline({ bucketName, filePath, mimeType, jobId, customMetadata });
+    return;
+  }
+
+  // ── PDF — page count check karo ───────────────────────────────────────────
+  const pageCount = await getPdfPageCount(bucketName, filePath);
+
+  log.info('PDF_PAGE_COUNT', { bucket: bucketName, file: filePath, pageCount, inlineLimit: INLINE_PAGE_LIMIT });
+
+  if (pageCount <= INLINE_PAGE_LIMIT) {
+    await handleInline({ bucketName, filePath, mimeType, jobId, customMetadata });
+  } else {
+    await handleBatch({ bucketName, filePath, mimeType, jobId, customMetadata, pageCount });
+  }
+});
+
+// ─── Inline handler ───────────────────────────────────────────────────────────
+async function handleInline({ bucketName, filePath, mimeType, jobId, customMetadata }) {
+  log.info('OCR_INLINE_START', { bucket: bucketName, file: filePath });
+
+  // Download
   const [fileBuffer] = await storage.bucket(bucketName).file(filePath).download();
 
   if (fileBuffer.length > MAX_FILE_BYTES) {
-    log.error('OCR_SKIP_FILE_TOO_LARGE', {
-      bucket: bucketName,
-      file:   filePath,
+    log.error('OCR_FILE_TOO_LARGE_FOR_INLINE', {
+      bucket: bucketName, file: filePath,
       sizeMB: (fileBuffer.length / 1024 / 1024).toFixed(1),
-      limitMB: 18,
-      hint:   'Switch to batch processing for large files',
     });
+    // File size badi hai lekin pages kam — batch pe route karo
+    log.info('OCR_ROUTING_TO_BATCH_FALLBACK', { bucket: bucketName, file: filePath });
+    await handleBatch({ bucketName, filePath, mimeType, jobId, customMetadata, pageCount: null });
     return;
   }
 
-  // ── Document AI ───────────────────────────────────────────────────────────
-  const processorName = `projects/${projectId}/locations/${location}/processors/${processorId}`;
-
-  let result;
+  let ocrPayload;
   try {
-    [result] = await docAIClient.processDocument({
-      name: processorName,
-      rawDocument: { content: fileBuffer, mimeType },
+    ocrPayload = await runInlineOcr({ fileBuffer, mimeType, filePath, bucketName, jobId, customMetadata });
+  } catch (err) {
+    log.error('OCR_INLINE_FAILED', { bucket: bucketName, file: filePath, error: err.message, code: err.code });
+    await markJobFailed(jobId, `Inline OCR failed: ${err.message}`);
+    return;
+  }
+
+  await saveAndPublish({ ocrPayload, filePath, bucketName, jobId, customMetadata, mode: 'inline' });
+}
+
+// ─── Batch handler ────────────────────────────────────────────────────────────
+async function handleBatch({ bucketName, filePath, mimeType, jobId, customMetadata, pageCount }) {
+  log.info('OCR_BATCH_SUBMIT_START', { bucket: bucketName, file: filePath, pageCount });
+
+  let operationName, outputPrefix, outputBucket;
+
+  try {
+    ({ operationName, outputPrefix, outputBucket } = await submitBatchOcr({
+      filePath, bucketName, mimeType,
+    }));
+  } catch (err) {
+    log.error('OCR_BATCH_SUBMIT_FAILED', {
+      bucket: bucketName, file: filePath, error: err.message, code: err.code,
+    });
+    await markJobFailed(jobId, `Batch OCR submit failed: ${err.message}`);
+    return;
+  }
+
+  // Firestore mein operation track karo — worker poll karega
+  try {
+    await firestore.collection('ocr_batch_operations').doc(operationName.split('/').pop()).set({
+      operationName,
+      outputBucket,
+      outputPrefix,
+      sourceFile:   filePath,
+      sourceBucket: bucketName,
+      jobId,
+      examId:       customMetadata.examid    || null,
+      subjectId:    customMetadata.subjectid || null,
+      student: {
+        schoolName: customMetadata.schoolname || null,
+        branchId:   customMetadata.branchid   || null,
+        classId:    customMetadata.classid    || null,
+        sectionId:  customMetadata.sectionid  || null,
+        studentId:  customMetadata.studentid  || null,
+      },
+      customMetadata,
+      pageCount:    pageCount ?? null,
+      status:       'pending',
+      submittedAt:  new Date().toISOString(),
+      pollAttempts: 0,
     });
   } catch (err) {
-    // Document AI errors (quota exceeded, timeout, invalid document) should NOT
-    // crash the function — log clearly and return so GCF doesn't retry forever.
-    log.error('OCR_DOCUMENT_AI_FAILED', {
-      bucket: bucketName,
-      file:   filePath,
-      error:  err.message,
-      code:   err.code,     // gRPC status code e.g. 4 = DEADLINE_EXCEEDED
-    });
+    log.error('OCR_BATCH_RECORD_FAILED', { operationName, error: err.message });
+    await markJobFailed(jobId, `Failed to record batch operation: ${err.message}`);
     return;
   }
 
-  const document = result.document;
-
-  if (!document) {
-    log.error('OCR_EMPTY_RESPONSE', { bucket: bucketName, file: filePath });
-    return;
+  // Job status → batch processing mein hai
+  if (jobId) {
+    await firestore.collection('exam_jobs').doc(jobId).update({
+      status:        'ocr_batch_pending',
+      operationName,
+      batchSubmittedAt: new Date().toISOString(),
+    }).catch(err => log.warn('JOB_BATCH_STATUS_UPDATE_FAILED', { jobId, error: err.message }));
   }
 
-  // ── Extract confidence scores ───────────────────────────────────────────
+  log.info('OCR_BATCH_SUBMITTED', {
+    bucket: bucketName, file: filePath, operationName, outputPrefix, jobId,
+  });
+}
 
-  // Token-level confidence (Document AI actual structure)
-  let pageConfidences = [];
-  let avgConfidence = null;
-
-  if (document.pages && document.pages.length > 0) {
-    pageConfidences = document.pages.map(page => {
-      const tokens = page.tokens || [];
-      if (tokens.length === 0) return null;
-      const sum = tokens.reduce((acc, t) => acc + (t.layout?.confidence ?? 0), 0);
-      return Number((sum / tokens.length).toFixed(4));
-    }).filter(v => v !== null);
-
-    if (pageConfidences.length > 0) {
-      const total = pageConfidences.reduce((a, b) => a + b, 0);
-      avgConfidence = Number((total / pageConfidences.length).toFixed(4));
-    }
-  }
-
-  // ── Save OCR output to GCS ────────────────────────────────────────────────
+// ─── Save OCR JSON + Publish ───────────────────────────────────────────────────
+// Inline aur batch dono ke liye same final step
+async function saveAndPublish({ ocrPayload, filePath, bucketName, jobId, customMetadata, mode }) {
   const outputPath = buildOcrOutputPath(filePath);
 
-  const layoutPages = extractLayoutPages(document);
-
-  const ocrPayload = {
-    sourceFile:     filePath,
-    bucket:         bucketName,
-    jobId:          jobId,
-    text:           document.text || '',
-    totalPages:     document.pages?.length || 0,
-    avgConfidence:  avgConfidence,
-    pageConfidence: pageConfidences,
-    pages:          layoutPages,
-    generatedAt:    new Date().toISOString(),
-    examId:         customMetadata.examid    || null,   // ← add
-    subjectId:      customMetadata.subjectid || null,   // ← add
-    // Student context — written by upload API, forwarded here for the AI pipeline
-    student: {
-      schoolName: customMetadata.schoolname || null,
-      branchId:   customMetadata.branchid   || null,
-      classId:    customMetadata.classid    || null,
-      sectionId:  customMetadata.sectionid  || null,
-      studentId:  customMetadata.studentid  || null,
-    },
-  };
-
+  // GCS mein save karo
   await storage.bucket(bucketName).file(outputPath).save(
     JSON.stringify(ocrPayload, null, 2),
     {
@@ -249,10 +279,9 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
       metadata: {
         metadata: {
           ocrGenerated: 'true',
-          jobId,
+          jobId:        jobId ?? '',
           sourceFile:   filePath,
-          // Propagate student context so downstream tools can read it from
-          // the OCR file's own metadata without parsing the JSON body
+          processingMode: mode,
           ...ocrPayload.student,
         },
       },
@@ -260,70 +289,42 @@ functions.cloudEvent('processOCR', async (cloudEvent) => {
   );
 
   log.info('OCR_OUTPUT_SAVED', {
-    bucket:     bucketName,
-    outputPath,
+    bucket: bucketName, outputPath,
     totalPages: ocrPayload.totalPages,
     textLength: ocrPayload.text.length,
+    mode,
   });
 
+  // Source file mark karo
   try {
     await storage.bucket(bucketName).file(filePath).setMetadata({
       metadata: { ocrGenerated: 'true' },
     });
-    log.info('OCR_SOURCE_MARKED', { bucket: bucketName, file: filePath });
   } catch (err) {
-    // Non-fatal — OCR already saved, sirf warning log karo
     log.warn('OCR_SOURCE_MARK_FAILED', { bucket: bucketName, file: filePath, error: err.message });
   }
 
-  // ── Publish to Pub/Sub (with retry) ──────────────────────────────────────
+  // Pub/Sub publish
   const message = {
     bucket:      bucketName,
     ocrPath:     outputPath,
     sourceFile:  filePath,
-    jobId:       jobId,
-    examId:      customMetadata.examid    || null,   // ← add
-    subjectId:   customMetadata.subjectid || null,   // ← add
+    jobId,
+    examId:      customMetadata.examid    || null,
+    subjectId:   customMetadata.subjectid || null,
     generatedAt: ocrPayload.generatedAt,
-    student:     ocrPayload.student,   // AI grading worker needs this immediately
+    student:     ocrPayload.student,
   };
 
-  const MAX_PUBLISH_ATTEMPTS = 3;
-  let published = false;
-
-  for (let attempt = 1; attempt <= MAX_PUBLISH_ATTEMPTS; attempt++) {
-    try {
-      await pubsub
-        .topic(TOPIC_NAME)
-        .publishMessage({ data: Buffer.from(JSON.stringify(message)) });
-      published = true;
-      break;
-    } catch (err) {
-      log.warn('OCR_PUBSUB_PUBLISH_FAILED', {
-        bucket:  bucketName,
-        file:    filePath,
-        attempt,
-        maxAttempts: MAX_PUBLISH_ATTEMPTS,
-        error:   err.message,
-      });
-
-      if (attempt < MAX_PUBLISH_ATTEMPTS) {
-        // Exponential backoff: 500ms, 1000ms
-        await new Promise((r) => setTimeout(r, 500 * attempt));
-      }
-    }
-  }
+  const published = await publishToPubSub(message, filePath, bucketName);
 
   if (published) {
-    log.info('OCR_PUBSUB_PUBLISHED', { bucket: bucketName, topic: TOPIC_NAME, ocrPath: outputPath });
+    log.info('OCR_PUBSUB_PUBLISHED', { bucket: bucketName, topic: TOPIC_NAME, outputPath, mode });
   } else {
-    // OCR succeeded and was saved — pipeline can recover by re-reading GCS.
-    // Throwing here would cause GCF to retry the entire function including re-running OCR.
-    log.error('OCR_PUBSUB_PUBLISH_EXHAUSTED', {
-      bucket:  bucketName,
-      file:    filePath,
-      ocrPath: outputPath,
-      hint:    'OCR JSON is saved in GCS. Trigger pipeline manually if needed.',
+    log.error('OCR_PUBSUB_EXHAUSTED', {
+      bucket: bucketName, file: filePath, outputPath, mode,
+      hint: 'OCR JSON saved in GCS — trigger manually if needed',
     });
+    await markJobFailed(jobId, `Pub/Sub publish failed — OCR saved at ${outputPath}`);
   }
-});
+}

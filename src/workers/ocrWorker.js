@@ -4,7 +4,8 @@ import { Firestore } from '@google-cloud/firestore';
 import dotenv        from 'dotenv';
 import { correctOCRText }        from "./ocrCorrector.js";
 import { segmentAnswersWithLLM } from "./answerSegmenter.js";
-import { gradeAllAnswers } from '../services/grading.service.js';
+import { gradeAllAnswers }       from '../services/grading.service.js';
+import { checkBatchOperation, parseBatchOutput } from '../../functions/process-ocr/batchOcr.js';
 
 dotenv.config();
 
@@ -14,12 +15,12 @@ const MAX_MESSAGES      = parseInt(process.env.WORKER_MAX_MESSAGES    || '5',   
 const DOWNLOAD_TIMEOUT  = parseInt(process.env.DOWNLOAD_TIMEOUT_MS    || '20000', 10);
 const OCR_LLM_TIMEOUT   = parseInt(process.env.OCR_LLM_TIMEOUT_MS     || '60000', 10);
 const SEG_LLM_TIMEOUT   = parseInt(process.env.SEG_LLM_TIMEOUT_MS     || '60000', 10);
+const BATCH_POLL_INTERVAL_MS  = parseInt(process.env.BATCH_POLL_INTERVAL_MS  || '60000', 10);
+const BATCH_MAX_POLL_ATTEMPTS = parseInt(process.env.BATCH_MAX_POLL_ATTEMPTS || '20',    10);
 
 const pubsub    = new PubSub({ projectId: PROJECT_ID });
 const storage   = new Storage({ projectId: PROJECT_ID });
-const firestore = new Firestore({
-  projectId: PROJECT_ID,
-});
+const firestore = new Firestore({ projectId: PROJECT_ID });
 
 const log = {
   info:  (event, fields = {}) => console.log  (JSON.stringify({ severity: 'INFO',    event, ts: new Date().toISOString(), ...fields })),
@@ -85,7 +86,7 @@ function layoutToLLMText(pages) {
     .join('\n\n');
 }
 
-let inFlight    = 0;
+let inFlight     = 0;
 let shuttingDown = false;
 
 function beginWork() {
@@ -105,6 +106,7 @@ function waitForInFlight(pollMs = 100) {
   });
 }
 
+// ─── Main message handler ─────────────────────────────────────────────────────
 async function handleMessage(message) {
   const messageId  = message.id;
   const rawPayload = message.data.toString();
@@ -345,7 +347,6 @@ async function handleMessage(message) {
   log.info('FIRESTORE_WRITE_COMPLETE', { messageId, ocrPath });
 
   // ── Extract examId + subjectId ────────────────────────────────────────────
-  // data (Pub/Sub message) ya ocrJson ke metadata se lo
   const jobId     = data.jobId     ?? null;
   const examId    = data.examId    ?? ocrJson?.examId    ?? null;
   const subjectId = data.subjectId ?? ocrJson?.subjectId ?? null;
@@ -358,7 +359,6 @@ async function handleMessage(message) {
         questionsToGrade: segmentedAnswers.questions.length,
       });
 
-      // Job status → grading
       if (jobId) {
         await firestore.collection('exam_jobs').doc(jobId).update({
           status: 'grading',
@@ -373,7 +373,6 @@ async function handleMessage(message) {
         jobId
       );
 
-      // exam_results collection mein save karo
       const resultDocId = `${student?.studentId ?? 'unknown'}_${examId}_${subjectId}`;
 
       await withTimeout(
@@ -388,7 +387,6 @@ async function handleMessage(message) {
 
       log.info('EXAM_RESULTS_SAVED', { messageId, jobId, resultDocId });
 
-      // exam_jobs → completed with grading data
       if (jobId) {
         await withTimeout(
           firestore.collection('exam_jobs').doc(jobId).update({
@@ -396,7 +394,6 @@ async function handleMessage(message) {
             questionsFound:   segmentedAnswers?.questions?.length ?? 0,
             avgConfidence:    ocrJson.avgConfidence  ?? null,
             segmentedAnswers: segmentedAnswers,
-            // Grading fields
             gradingStatus:    gradingResult.gradingStatus,
             totalMarks:       gradingResult.totalMarks,
             maxMarks:         gradingResult.maxMarks,
@@ -428,8 +425,6 @@ async function handleMessage(message) {
         messageId, jobId, error: err.message, code: err.code,
       });
 
-      // Grading fail hone pe bhi job complete mark karo
-      // OCR + segmentation successful the — sirf grading fail hui
       if (jobId) {
         await firestore.collection('exam_jobs').doc(jobId).update({
           status:           'completed',
@@ -445,7 +440,6 @@ async function handleMessage(message) {
     }
 
   } else {
-    // Grading skip — examId ya subjectId nahi mila
     log.warn('GRADING_SKIPPED', {
       messageId,
       jobId,
@@ -456,7 +450,6 @@ async function handleMessage(message) {
         : 'no_questions_found',
     });
 
-    // Job complete mark karo without grading
     if (jobId) {
       await withTimeout(
         firestore.collection('exam_jobs').doc(jobId).update({
@@ -499,17 +492,20 @@ async function handleMessage(message) {
   });
 }
 
+// ─── Pub/Sub subscription ─────────────────────────────────────────────────────
 const subscription = pubsub.subscription(SUBSCRIPTION, {
   flowControl: { maxMessages: MAX_MESSAGES },
 });
 
 log.info('WORKER_STARTED', {
-  subscription:  SUBSCRIPTION,
-  maxMessages:   MAX_MESSAGES,
-  projectId:     PROJECT_ID,
+  subscription:    SUBSCRIPTION,
+  maxMessages:     MAX_MESSAGES,
+  projectId:       PROJECT_ID,
   downloadTimeout: DOWNLOAD_TIMEOUT,
   ocrLlmTimeout:   OCR_LLM_TIMEOUT,
   segLlmTimeout:   SEG_LLM_TIMEOUT,
+  batchPollIntervalMs:  BATCH_POLL_INTERVAL_MS,
+  batchMaxPollAttempts: BATCH_MAX_POLL_ATTEMPTS,
 });
 
 subscription.on('message', async (message) => {
@@ -558,9 +554,246 @@ subscription.on('close', () => {
   log.info('WORKER_SUBSCRIPTION_CLOSED', {});
 });
 
+// ─── Batch OCR Poller ─────────────────────────────────────────────────────────
+
+async function pollBatchOperations() {
+  if (shuttingDown) return;
+
+  let pending = [];
+  try {
+    const snap = await firestore
+      .collection('ocr_batch_operations')
+      .where('status', '==', 'pending')
+      .limit(10)
+      .get();
+    pending = snap.docs;
+  } catch (err) {
+    log.error('BATCH_POLL_FETCH_FAILED', { error: err.message });
+    return;
+  }
+
+  if (pending.length === 0) return;
+
+  log.info('BATCH_POLL_CHECK', { pendingCount: pending.length });
+
+  for (const docSnap of pending) {
+    const data = docSnap.data();
+    const {
+      operationName,
+      jobId,
+      outputBucket,
+      outputPrefix,
+      sourceFile,
+      sourceBucket,
+      customMetadata,
+      pollAttempts,
+    } = data;
+
+    // ── Max attempts exceed — timeout fail ───────────────────────────────
+    if ((pollAttempts ?? 0) >= BATCH_MAX_POLL_ATTEMPTS) {
+      log.error('BATCH_POLL_MAX_ATTEMPTS', { operationName, jobId, pollAttempts });
+      await docSnap.ref.update({ status: 'failed', failedAt: new Date().toISOString() });
+      if (jobId) {
+        await firestore.collection('exam_jobs').doc(jobId).update({
+          status:   'failed',
+          error:    `Batch OCR timed out after ${BATCH_MAX_POLL_ATTEMPTS} poll attempts (~${BATCH_MAX_POLL_ATTEMPTS} min)`,
+          failedAt: new Date().toISOString(),
+        }).catch(() => {});
+      }
+      continue;
+    }
+
+    try {
+      // ── Operation status check ────────────────────────────────────────
+      const { done, error, individualProcessStatuses } =
+        await checkBatchOperation(operationName);
+
+      await docSnap.ref.update({ pollAttempts: (pollAttempts ?? 0) + 1 });
+
+      if (!done) {
+        log.info('BATCH_POLL_IN_PROGRESS', {
+          operationName, jobId,
+          pollAttempts: (pollAttempts ?? 0) + 1,
+        });
+        continue;
+      }
+
+      // ── Operation-level error ─────────────────────────────────────────
+      if (error) {
+        log.error('BATCH_OPERATION_FAILED', { operationName, jobId, error: error.message });
+        await docSnap.ref.update({ status: 'failed', failedAt: new Date().toISOString() });
+        if (jobId) {
+          await firestore.collection('exam_jobs').doc(jobId).update({
+            status:   'failed',
+            error:    `Batch OCR operation failed: ${error.message}`,
+            failedAt: new Date().toISOString(),
+          }).catch(() => {});
+        }
+        continue;
+      }
+
+      // ── Individual document error ─────────────────────────────────────
+      const docStatus = individualProcessStatuses?.[0];
+      if (docStatus?.status?.code && docStatus.status.code !== 0) {
+        const reason = docStatus.status.message || 'Unknown document processing error';
+        log.error('BATCH_DOCUMENT_FAILED', { operationName, jobId, reason });
+        await docSnap.ref.update({ status: 'failed', failedAt: new Date().toISOString() });
+        if (jobId) {
+          await firestore.collection('exam_jobs').doc(jobId).update({
+            status:   'failed',
+            error:    `Batch document failed: ${reason}`,
+            failedAt: new Date().toISOString(),
+          }).catch(() => {});
+        }
+        continue;
+      }
+
+      log.info('BATCH_OPERATION_COMPLETE', { operationName, jobId });
+
+      // ── Output parse karo ─────────────────────────────────────────────
+      let ocrPayload;
+      try {
+        ocrPayload = await parseBatchOutput({
+          outputBucket,
+          outputPrefix,
+          filePath:       sourceFile,
+          jobId,
+          customMetadata: customMetadata ?? {},
+        });
+      } catch (parseErr) {
+        log.error('BATCH_OUTPUT_PARSE_FAILED', { operationName, jobId, error: parseErr.message });
+        await docSnap.ref.update({ status: 'failed', failedAt: new Date().toISOString() });
+        if (jobId) {
+          await firestore.collection('exam_jobs').doc(jobId).update({
+            status:   'failed',
+            error:    `Batch output parse failed: ${parseErr.message}`,
+            failedAt: new Date().toISOString(),
+          }).catch(() => {});
+        }
+        continue;
+      }
+
+      // ── OCR JSON GCS mein save karo ───────────────────────────────────
+      const extIdx     = sourceFile.lastIndexOf('.');
+      const outputPath = (extIdx !== -1 ? sourceFile.slice(0, extIdx) : sourceFile) + '-ocr.json';
+
+      try {
+        await storage.bucket(sourceBucket).file(outputPath).save(
+          JSON.stringify(ocrPayload, null, 2),
+          {
+            contentType: 'application/json',
+            metadata: {
+              metadata: {
+                ocrGenerated:   'true',
+                jobId:          jobId ?? '',
+                sourceFile,
+                processingMode: 'batch',
+              },
+            },
+          }
+        );
+        log.info('BATCH_OCR_JSON_SAVED', { operationName, jobId, outputPath });
+      } catch (saveErr) {
+        log.error('BATCH_OCR_JSON_SAVE_FAILED', { operationName, jobId, error: saveErr.message });
+        await docSnap.ref.update({ status: 'failed', failedAt: new Date().toISOString() });
+        if (jobId) {
+          await firestore.collection('exam_jobs').doc(jobId).update({
+            status: 'failed',
+            error:  `OCR JSON save to GCS failed: ${saveErr.message}`,
+          }).catch(() => {});
+        }
+        continue;
+      }
+
+      // ── Pub/Sub publish — existing worker pipeline trigger hoga ───────
+      const pubsubMessage = {
+        bucket:      sourceBucket,
+        ocrPath:     outputPath,
+        sourceFile,
+        jobId,
+        examId:      customMetadata?.examid    || null,
+        subjectId:   customMetadata?.subjectid || null,
+        generatedAt: ocrPayload.generatedAt,
+        student:     ocrPayload.student,
+      };
+
+      let published = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await pubsub
+            .topic(process.env.OCR_TOPIC || 'exam-ocr-completed')
+            .publishMessage({ data: Buffer.from(JSON.stringify(pubsubMessage)) });
+          published = true;
+          break;
+        } catch (pubErr) {
+          log.warn('BATCH_PUBSUB_ATTEMPT_FAILED', {
+            operationName, jobId, attempt, error: pubErr.message,
+          });
+          if (attempt < 3) await new Promise(r => setTimeout(r, 500 * attempt));
+        }
+      }
+
+      if (published) {
+        log.info('BATCH_PUBSUB_PUBLISHED', { operationName, jobId, outputPath });
+      } else {
+        log.error('BATCH_PUBSUB_EXHAUSTED', {
+          operationName, jobId, outputPath,
+          hint: 'OCR JSON saved in GCS — trigger pipeline manually if needed',
+        });
+        if (jobId) {
+          await firestore.collection('exam_jobs').doc(jobId).update({
+            status: 'failed',
+            error:  `Pub/Sub publish failed after 3 attempts — OCR JSON saved at gs://${sourceBucket}/${outputPath}`,
+          }).catch(() => {});
+        }
+      }
+
+      // ── Operation record complete mark karo ───────────────────────────
+      await docSnap.ref.update({
+        status:      'completed',
+        completedAt: new Date().toISOString(),
+        outputPath,
+      });
+
+    } catch (err) {
+      // Is iteration ka error — agli operation pe jao, poora poller mat rokna
+      log.error('BATCH_POLL_ITERATION_ERROR', {
+    operationName, jobId, error: err.message,
+  });
+
+  await docSnap.ref.update({
+    status: 'failed',
+    error: err.message,
+    failedAt: new Date().toISOString(),
+  });
+
+  if (jobId) {
+    await firestore.collection('exam_jobs').doc(jobId).update({
+      status: 'failed',
+      error: err.message,
+      failedAt: new Date().toISOString(),
+    }).catch(() => {});
+  }
+    }
+  }
+}
+
+// Poller start karo
+const batchPoller = setInterval(pollBatchOperations, BATCH_POLL_INTERVAL_MS);
+
+// Startup pe bhi ek baar chalao — restart pe pending operations miss na hon
+pollBatchOperations().catch(err =>
+  log.error('BATCH_POLL_STARTUP_ERROR', { error: err.message })
+);
+
+// ─── Graceful shutdown ────────────────────────────────────────────────────────
 async function shutdown(signal) {
   log.info('WORKER_SHUTDOWN_START', { signal, inFlight });
   shuttingDown = true;
+
+  // Poller band karo pehle — naya poll cycle shuru na ho
+  clearInterval(batchPoller);
+  log.info('WORKER_BATCH_POLLER_STOPPED', { signal });
 
   try {
     await subscription.close();
@@ -576,7 +809,7 @@ async function shutdown(signal) {
   process.exit(0);
 }
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
   log.error('UNHANDLED_REJECTION', {
     reason: reason?.message ?? String(reason),
     stack:  reason?.stack,

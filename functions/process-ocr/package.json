@@ -12,6 +12,7 @@
   "dependencies": {
     "@google-cloud/functions-framework": "^3.4.0",
     "@google-cloud/documentai": "^8.0.0",
+    "@google-cloud/firestore": "^7.0.0",
     "@google-cloud/storage": "^7.0.0",
     "@google-cloud/pubsub": "^4.0.0",
     "@google/generative-ai": "^0.12.0"

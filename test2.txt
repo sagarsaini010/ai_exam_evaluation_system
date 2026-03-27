@@ -131,3 +131,68 @@ OUTPUT FORMAT:
 
 
 ID: 5074052648139751424
+
+                        ┌──────────────────────┐
+                        │      Frontend        │
+                        │ Upload PDF / View    │
+                        └──────────┬───────────┘
+                                   │
+                                   ▼
+                    ┌──────────────────────────┐
+                    │ API Server (Cloud Run)   │
+                    │ - Auth                   │
+                    │ - Generate Upload URL   │
+                    │ - Status API            │
+                    └──────────┬──────────────┘
+                               │
+                               ▼
+                ┌──────────────────────────────┐
+                │ Google Cloud Storage (GCS)  │
+                │ PDF Upload                  │
+                └──────────┬──────────────────┘
+                           │
+                           ▼
+                ┌──────────────────────────────┐
+                │ Document AI OCR             │
+                │ Text + Confidence + Layout  │
+                └──────────┬──────────────────┘
+                           │
+                           ▼
+                ┌──────────────────────────────┐
+                │ Pub/Sub (Event Queue)       │
+                │ exam-ocr-completed         │
+                └──────────┬──────────────────┘
+                           │
+                           ▼
+          ┌────────────────────────────────────────┐
+          │ Worker (Cloud Run - Auto Scaling)      │
+          │                                        │
+          │ 1. OCR Correction (LLM)                │
+          │ 2. Layout-aware parsing                │
+          │ 3. Answer Segmentation                │
+          │ 4. Embedding generation               │
+          │ 5. Vector Search                      │
+          │ 6. LLM Grading                        │
+          └──────────┬────────────────────────────┘
+                     │
+                     ▼
+      ┌──────────────────────────────────────────┐
+      │ Vector DB (Vertex AI / Qdrant)          │
+      │ - Question embeddings                   │
+      │ - Model answers                         │
+      └──────────┬──────────────────────────────┘
+                 │
+                 ▼
+      ┌──────────────────────────────────────────┐
+      │ Firestore                               │
+      │ - OCR data                              │
+      │ - Answers                               │
+      │ - Marks + feedback                      │
+      │ - Status                                │
+      └──────────┬──────────────────────────────┘
+                 │
+                 ▼
+      ┌──────────────────────────────────────────┐
+      │ Frontend (Realtime / Polling)            │
+      │ Show result                             │
+      └──────────────────────────────────────────┘
