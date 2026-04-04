@@ -237,3 +237,24 @@ Mock test evaluation systems
 Sagar Saini
 
 Software Developer | AI System Builder
+
+## 🖥 React Frontend (new)
+
+A React (Vite) frontend is available in `frontend/` with two flows:
+
+- **Upload Flow:** generate signed URL, upload student answer sheet directly to GCS, then check status.
+- **QA Flow:** upload question paper PDF for OCR parsing, review/edit parsed Q&A, and confirm ingestion.
+
+### Run frontend locally
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Create `.env` inside `frontend/` if backend is not on port 3000:
+
+```bash
+VITE_API_BASE_URL=http://localhost:3000
+```
