@@ -255,7 +255,7 @@ async function handleBatch({ bucketName, filePath, mimeType, jobId, customMetada
   // Job status → batch processing mein hai
   if (jobId) {
     await firestore.collection('exam_jobs').doc(jobId).update({
-      status:        'ocr_batch_pending',
+      status:        'pending',
       operationName,
       batchSubmittedAt: new Date().toISOString(),
     }).catch(err => log.warn('JOB_BATCH_STATUS_UPDATE_FAILED', { jobId, error: err.message }));

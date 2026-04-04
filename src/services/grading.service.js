@@ -1,6 +1,6 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Firestore }          from '@google-cloud/firestore';
-import { generateEmbedding }  from './embedding.service.js';
+import { generateEmbeddingsBatch } from './embedding.service.js';
 import { queryNearest }       from './vectorSearch.service.js';
 import {
   preGradingCheck,
@@ -27,6 +27,14 @@ const log = {
 
 const RETRY_CONFIG = { maxAttempts: 3, baseDelayMs: 1000, maxDelayMs: 10000 };
 
+// ─── Grading concurrency config ───────────────────────────────────────────────
+// Gemini RPM ke hisaab se adjust karo:
+//   Free tier  → GRADING_CONCURRENCY = 5
+//   Paid tier  → GRADING_CONCURRENCY = 10–20
+const GRADING_CONCURRENCY = parseInt(process.env.GRADING_CONCURRENCY ?? '5', 10);
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
 function withTimeout(promise, ms, label = 'operation') {
   return Promise.race([
     promise,
@@ -49,10 +57,33 @@ function isRetryable(err) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// ─── Controlled parallel executor ─────────────────────────────────────────────
+// items ko concurrency limit ke saath parallel chalata hai
+// Promise.all se better — ek saath sab nahi, N ek saath
+
+async function parallelLimit(items, concurrency, asyncFn) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const i = nextIndex++;
+      try {
+        results[i] = { status: 'fulfilled', value: await asyncFn(items[i], i) };
+      } catch (err) {
+        results[i] = { status: 'rejected', reason: err };
+      }
+    }
+  }
+
+  // N workers ek saath chalao
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  return results;
+}
+
 // ─── Grading prompt builder ───────────────────────────────────────────────────
 
 function buildGradingPrompt(question, modelAnswer, studentAnswer, maxMarks, answerType) {
-
   const typeInstruction = {
     visual: `NOTE: This question requires a diagram/map/table.
 OCR may have missed visual content. Grade only the written explanation.
@@ -106,7 +137,7 @@ Return ONLY this JSON — no explanation, no markdown, no extra text:
 }`;
 }
 
-// ─── Single question Gemini grading ──────────────────────────────────────────
+// ─── Single Gemini grading call with retry ────────────────────────────────────
 
 async function callGeminiGrading(question, modelAnswer, studentAnswer, maxMarks, answerType) {
   let lastError = null;
@@ -123,11 +154,7 @@ async function callGeminiGrading(question, modelAnswer, studentAnswer, maxMarks,
       }
 
       const prompt = buildGradingPrompt(question, modelAnswer, studentAnswer, maxMarks, answerType);
-      const result = await withTimeout(
-        model.generateContent(prompt),
-        60_000,
-        'Gemini grading'
-      );
+      const result = await withTimeout(model.generateContent(prompt), 60_000, 'Gemini grading');
 
       const raw     = result.response.text();
       const cleaned = raw.replace(/```json|```/gi, '').trim();
@@ -145,19 +172,12 @@ async function callGeminiGrading(question, modelAnswer, studentAnswer, maxMarks,
         }
       }
 
-      // Sanitize — marks must be within bounds
-      const marksAwarded = Math.min(
-        Math.max(0, Number(parsed.marksAwarded ?? 0)),
-        maxMarks
-      );
-
       return {
-        marksAwarded,
+        marksAwarded:     Math.min(Math.max(0, Number(parsed.marksAwarded ?? 0)), maxMarks),
         feedback:         String(parsed.feedback ?? '').trim(),
         keyPointsCovered: Array.isArray(parsed.keyPointsCovered) ? parsed.keyPointsCovered : [],
         keyPointsMissed:  Array.isArray(parsed.keyPointsMissed)  ? parsed.keyPointsMissed  : [],
-        confidence:       ['high', 'medium', 'low'].includes(parsed.confidence)
-                            ? parsed.confidence : 'medium',
+        confidence:       ['high', 'medium', 'low'].includes(parsed.confidence) ? parsed.confidence : 'medium',
       };
 
     } catch (err) {
@@ -170,203 +190,155 @@ async function callGeminiGrading(question, modelAnswer, studentAnswer, maxMarks,
     }
   }
 
-  // Gemini fail hua — fallback result return karo
   log.error('GRADING_ALL_ATTEMPTS_FAILED', { error: lastError?.message });
   return {
-    marksAwarded:     0,
-    feedback:         'Grading could not be completed automatically. Please review manually.',
-    keyPointsCovered: [],
-    keyPointsMissed:  [],
-    confidence:       'low',
-    gradingFailed:    true,
+    marksAwarded: 0,
+    feedback:     'Grading could not be completed automatically. Please review manually.',
+    keyPointsCovered: [], keyPointsMissed: [],
+    confidence:   'low',
+    gradingFailed: true,
   };
 }
 
-// ─── Main export — grade all segmented answers ────────────────────────────────
+// ─── PHASE 1 — Pre-check + classify ──────────────────────────────────────────
+// Saare questions scan karo — blank/short ko alag karo, baaki ready karo
 
-/**
- * Saare segmented answers ko grade karo.
- * Sequential processing with delays to respect API quotas.
- *
- * @param {Array}  segmentedQuestions   worker ke segmentedAnswers.questions
- * @param {string} examId
- * @param {string} subjectId
- * @param {object} student              { schoolName, branchId, classId, sectionId, studentId }
- * @param {string} jobId
- * @returns {object}  complete grading result
- */
-export async function gradeAllAnswers(segmentedQuestions, examId, subjectId, student, jobId) {
-  const startedAt    = Date.now();
-  const gradedAnswers = [];
-
-  log.info('GRADING_START', {
-    jobId,
-    examId,
-    subjectId,
-    totalQuestions: segmentedQuestions.length,
-  });
+function classifyQuestions(segmentedQuestions) {
+  const skipped = [];
+  const toProcess = [];
 
   for (const q of segmentedQuestions) {
-    const questionNumber = q.questionNumber;
-    const studentAnswer  = (q.answer ?? '').trim();
-    const questionText   = (q.question ?? '').trim();
-
-    log.info('GRADING_QUESTION_START', { jobId, questionNumber });
-
-    // ── Pre-grading check ──────────────────────────────────────────────────
+    const studentAnswer = (q.answer ?? '').trim();
+    const questionText  = (q.question ?? '').trim();
     const { skip, skipReason, marksAwarded: skipMarks } = preGradingCheck(studentAnswer);
 
     if (skip) {
-      log.info('GRADING_QUESTION_SKIPPED', { jobId, questionNumber, skipReason });
-      gradedAnswers.push({
-        questionNumber,
+      skipped.push({
+        questionNumber:   q.questionNumber,
         studentAnswer,
-        question:         null,
-        modelAnswer:      null,
-        maxMarks:         null,
-        marksAwarded:     skipMarks,
-        marksOverride:    null,
-        feedback:         `Answer was ${skipReason === 'blank_answer' ? 'blank' : 'too short'}.`,
-        keyPointsCovered: [],
-        keyPointsMissed:  [],
-        confidence:       'high',
-        answerType:       'text',
-        matchDistance:    null,
-        datapointId:      null,
-        gradingSkipped:   true,
         skipReason,
-        flags:            buildFlags({ skipReason, isUnmatched: false }),
+        skipMarks,
+        answerType:       'text',
       });
-      continue;
-    }
-
-    // ── Detect answer type ─────────────────────────────────────────────────
-    const answerType = detectAnswerType(studentAnswer, questionText);
-
-    // ── Embed student answer ───────────────────────────────────────────────
-    let embedding;
-    try {
-      embedding = await withTimeout(
-        generateEmbedding(studentAnswer, 'RETRIEVAL_QUERY'),
-        60_000,
-        `embed question ${questionNumber}`
-      );
-    } catch (err) {
-      log.error('GRADING_EMBED_FAILED', { jobId, questionNumber, error: err.message });
-      gradedAnswers.push({
-        questionNumber,
+    } else {
+      toProcess.push({
+        questionNumber: q.questionNumber,
         studentAnswer,
-        question:         null,
-        modelAnswer:      null,
-        maxMarks:         null,
-        marksAwarded:     0,
-        marksOverride:    null,
-        feedback:         'Embedding failed. Please review manually.',
-        keyPointsCovered: [],
-        keyPointsMissed:  [],
-        confidence:       'low',
-        answerType,
-        matchDistance:    null,
-        datapointId:      null,
-        gradingSkipped:   true,
-        skipReason:       'embedding_failed',
-        flags:            ['embedding_failed'],
+        questionText,
+        answerType:     detectAnswerType(studentAnswer, questionText),
       });
-      await sleep(2000);
-      continue;
+    }
+  }
+
+  log.info('CLASSIFY_DONE', { total: segmentedQuestions.length, toProcess: toProcess.length, skipped: skipped.length });
+  return { skipped, toProcess };
+}
+
+// ─── PHASE 2 — Batch embeddings ───────────────────────────────────────────────
+// Saare valid answers ke embeddings ek saath generate karo
+
+async function embedAllAnswers(toProcess, jobId) {
+  const texts = toProcess.map(q => q.studentAnswer);
+
+  log.info('EMBED_PHASE_START', { jobId, count: texts.length });
+
+  // batchSize=10, delayMs=500 — embedding.service se
+  const embeddingResults = await generateEmbeddingsBatch(texts, 10, 500);
+
+  log.info('EMBED_PHASE_DONE', { jobId });
+
+  // Har question ke saath embedding attach karo
+  return toProcess.map((q, i) => ({
+    ...q,
+    embedding:       embeddingResults[i].success ? embeddingResults[i].embedding : null,
+    embeddingFailed: !embeddingResults[i].success,
+    embeddingError:  embeddingResults[i].error ?? null,
+  }));
+}
+
+// ─── PHASE 3 — Parallel vector search + Firestore fetch ───────────────────────
+// Saare questions ke liye ek saath vector search aur metadata fetch karo
+
+async function fetchAllModelAnswers(withEmbeddings, examId, subjectId, jobId) {
+  log.info('FETCH_PHASE_START', { jobId, count: withEmbeddings.length });
+
+  const results = await parallelLimit(withEmbeddings, 10, async (q) => {
+    // Embedding fail hua tha — skip
+    if (q.embeddingFailed) {
+      return { ...q, fetchFailed: true, failReason: 'embedding_failed' };
     }
 
-    // ── Vector search — nearest Q+A pair ──────────────────────────────────
+    // Vector search
     let neighbors = [];
     try {
       neighbors = await withTimeout(
-        queryNearest(embedding, examId, subjectId, 1),
+        queryNearest(q.embedding, examId, subjectId, 1),
         30_000,
-        `vector search question ${questionNumber}`
+        `vector search Q${q.questionNumber}`
       );
     } catch (err) {
-      log.error('GRADING_VECTOR_SEARCH_FAILED', { jobId, questionNumber, error: err.message });
+      log.error('VECTOR_SEARCH_FAILED', { jobId, questionNumber: q.questionNumber, error: err.message });
+      return { ...q, fetchFailed: true, failReason: 'vector_search_failed' };
     }
 
-    // No match found
     if (!neighbors.length) {
-      log.warn('GRADING_NO_MATCH', { jobId, questionNumber });
-      gradedAnswers.push({
-        questionNumber,
-        studentAnswer,
-        question:         null,
-        modelAnswer:      null,
-        maxMarks:         null,
-        marksAwarded:     0,
-        marksOverride:    null,
-        feedback:         'No matching question found in database. Please review manually.',
-        keyPointsCovered: [],
-        keyPointsMissed:  [],
-        confidence:       'low',
-        answerType,
-        matchDistance:    null,
-        datapointId:      null,
-        gradingSkipped:   true,
-        skipReason:       'unmatched_question',
-        flags:            buildFlags({ isUnmatched: true }),
-      });
-      await sleep(2000);
-      continue;
+      log.warn('NO_MATCH', { jobId, questionNumber: q.questionNumber });
+      return { ...q, fetchFailed: true, failReason: 'unmatched_question' };
     }
 
     const { datapointId, distance: matchDistance } = neighbors[0];
 
-    // ── Fetch model answer from Firestore ──────────────────────────────────
-    let qaMetadata;
+    // Firestore fetch
+    let qaMetadata = null;
     try {
       const doc = await withTimeout(
         firestore.collection('qaMetadata').doc(datapointId).get(),
         10_000,
-        `fetch qaMetadata ${datapointId}`
+        `firestore Q${q.questionNumber}`
       );
       qaMetadata = doc.exists ? doc.data() : null;
     } catch (err) {
-      log.error('GRADING_METADATA_FETCH_FAILED', { jobId, questionNumber, datapointId, error: err.message });
+      log.error('FIRESTORE_FETCH_FAILED', { jobId, questionNumber: q.questionNumber, error: err.message });
+      return { ...q, datapointId, matchDistance, fetchFailed: true, failReason: 'firestore_failed' };
     }
 
     if (!qaMetadata) {
-      log.warn('GRADING_METADATA_NOT_FOUND', { jobId, questionNumber, datapointId });
-      gradedAnswers.push({
-        questionNumber,
-        studentAnswer,
-        question:         null,
-        modelAnswer:      null,
-        maxMarks:         null,
-        marksAwarded:     0,
-        marksOverride:    null,
-        feedback:         'Model answer not found. Please review manually.',
-        keyPointsCovered: [],
-        keyPointsMissed:  [],
-        confidence:       'low',
-        answerType,
-        matchDistance,
-        datapointId,
-        gradingSkipped:   true,
-        skipReason:       'model_answer_not_found',
-        flags:            ['model_answer_not_found'],
-      });
-      await sleep(2000);
-      continue;
+      return { ...q, datapointId, matchDistance, fetchFailed: true, failReason: 'model_answer_not_found' };
     }
 
-    const { question, modelAnswer, maxMarks } = qaMetadata;
+    return {
+      ...q,
+      datapointId,
+      matchDistance,
+      fetchFailed:  false,
+      question:     qaMetadata.question,
+      modelAnswer:  qaMetadata.modelAnswer,
+      maxMarks:     qaMetadata.maxMarks,
+    };
+  });
 
-    // ── Gemini grading ─────────────────────────────────────────────────────
+  log.info('FETCH_PHASE_DONE', { jobId });
+  return results.map(r => r.status === 'fulfilled' ? r.value : { ...r, fetchFailed: true, failReason: 'unexpected_error' });
+}
+
+// ─── PHASE 4 — Parallel Gemini grading ───────────────────────────────────────
+// GRADING_CONCURRENCY questions ek saath grade karo
+
+async function gradeAllParallel(withMetadata, jobId) {
+  log.info('GRADING_PHASE_START', { jobId, count: withMetadata.length, concurrency: GRADING_CONCURRENCY });
+
+  const results = await parallelLimit(withMetadata, GRADING_CONCURRENCY, async (q) => {
+    if (q.fetchFailed) return q; // pehle se fail — grading skip
+
     const gradingResult = await callGeminiGrading(
-      question, modelAnswer, studentAnswer, maxMarks, answerType
+      q.question, q.modelAnswer, q.studentAnswer, q.maxMarks, q.answerType
     );
 
-    // ── Build flags ────────────────────────────────────────────────────────
     const flags = buildFlags({
-      matchDistance,
-      marksAwarded:    gradingResult.marksAwarded,
-      studentAnswer,
-      answerType,
+      matchDistance:    q.matchDistance,
+      marksAwarded:     gradingResult.marksAwarded,
+      studentAnswer:    q.studentAnswer,
+      answerType:       q.answerType,
       geminiConfidence: gradingResult.confidence,
       skipReason:       null,
       isUnmatched:      false,
@@ -376,66 +348,177 @@ export async function gradeAllAnswers(segmentedQuestions, examId, subjectId, stu
 
     log.info('GRADING_QUESTION_COMPLETE', {
       jobId,
-      questionNumber,
-      datapointId,
-      marksAwarded: gradingResult.marksAwarded,
-      maxMarks,
-      matchDistance: matchDistance.toFixed(4),
+      questionNumber: q.questionNumber,
+      marksAwarded:   gradingResult.marksAwarded,
+      maxMarks:       q.maxMarks,
+      matchDistance:  q.matchDistance?.toFixed(4),
       flags,
     });
 
+    return { ...q, gradingResult, flags, gradingSkipped: false };
+  });
+
+  log.info('GRADING_PHASE_DONE', { jobId });
+  return results.map(r => r.status === 'fulfilled' ? r.value : { ...r.reason, fetchFailed: true, failReason: 'grading_crashed' });
+}
+
+// ─── Result assembler ─────────────────────────────────────────────────────────
+// Saare phases ke results ko final gradedAnswers format mein lao
+
+function assembleResults(skipped, graded) {
+  const gradedAnswers = [];
+
+  // Skipped questions
+  for (const q of skipped) {
     gradedAnswers.push({
-      questionNumber,
-      studentAnswer,
-      question,
-      modelAnswer,
-      maxMarks,
-      marksAwarded:     gradingResult.marksAwarded,
-      marksOverride:    null,         // teacher baad mein override kar sakta hai
-      feedback:         gradingResult.feedback,
-      keyPointsCovered: gradingResult.keyPointsCovered,
-      keyPointsMissed:  gradingResult.keyPointsMissed,
-      confidence:       gradingResult.confidence,
-      answerType,
-      matchDistance,
-      datapointId,
-      gradingSkipped:   false,
-      skipReason:       null,
-      flags,
+      questionNumber:   q.questionNumber,
+      studentAnswer:    q.studentAnswer,
+      question:         null,
+      modelAnswer:      null,
+      maxMarks:         null,
+      marksAwarded:     q.skipMarks,
+      marksOverride:    null,
+      feedback:         `Answer was ${q.skipReason === 'blank_answer' ? 'blank' : 'too short'}.`,
+      keyPointsCovered: [],
+      keyPointsMissed:  [],
+      confidence:       'high',
+      answerType:       'text',
+      matchDistance:    null,
+      datapointId:      null,
+      gradingSkipped:   true,
+      skipReason:       q.skipReason,
+      flags:            buildFlags({ skipReason: q.skipReason, isUnmatched: false }),
     });
-
-    // Rate limiting — 2s between questions
-    await sleep(2000);
   }
 
-  // ── Aggregate results ──────────────────────────────────────────────────────
+  // Processed questions
+  for (const q of graded) {
+    if (q.fetchFailed) {
+      // Kisi bhi phase mein fail hua
+      gradedAnswers.push({
+        questionNumber:   q.questionNumber,
+        studentAnswer:    q.studentAnswer,
+        question:         null,
+        modelAnswer:      null,
+        maxMarks:         null,
+        marksAwarded:     0,
+        marksOverride:    null,
+        feedback:         failReasonToFeedback(q.failReason),
+        keyPointsCovered: [],
+        keyPointsMissed:  [],
+        confidence:       'low',
+        answerType:       q.answerType ?? 'text',
+        matchDistance:    q.matchDistance ?? null,
+        datapointId:      q.datapointId  ?? null,
+        gradingSkipped:   true,
+        skipReason:       q.failReason,
+        flags:            buildFlags({ skipReason: q.failReason, isUnmatched: q.failReason === 'unmatched_question' }),
+      });
+    } else {
+      gradedAnswers.push({
+        questionNumber:   q.questionNumber,
+        studentAnswer:    q.studentAnswer,
+        question:         q.question,
+        modelAnswer:      q.modelAnswer,
+        maxMarks:         q.maxMarks,
+        marksAwarded:     q.gradingResult.marksAwarded,
+        marksOverride:    null,
+        feedback:         q.gradingResult.feedback,
+        keyPointsCovered: q.gradingResult.keyPointsCovered,
+        keyPointsMissed:  q.gradingResult.keyPointsMissed,
+        confidence:       q.gradingResult.confidence,
+        answerType:       q.answerType,
+        matchDistance:    q.matchDistance,
+        datapointId:      q.datapointId,
+        gradingSkipped:   false,
+        skipReason:       null,
+        flags:            q.flags,
+      });
+    }
+  }
+
+  // Question number ke order mein sort karo
+  gradedAnswers.sort((a, b) => a.questionNumber - b.questionNumber);
+  return gradedAnswers;
+}
+
+function failReasonToFeedback(reason) {
+  return {
+    embedding_failed:       'Embedding failed. Please review manually.',
+    vector_search_failed:   'Vector search failed. Please review manually.',
+    unmatched_question:     'No matching question found in database. Please review manually.',
+    firestore_failed:       'Database fetch failed. Please review manually.',
+    model_answer_not_found: 'Model answer not found. Please review manually.',
+    grading_crashed:        'Grading crashed unexpectedly. Please review manually.',
+  }[reason] ?? 'An unknown error occurred. Please review manually.';
+}
+
+// ─── Main export ──────────────────────────────────────────────────────────────
+
+/**
+ * Redesigned parallel grading pipeline:
+ *
+ *  Phase 1 — Classify   : blank/short answers ko instantly skip karo        [sync]
+ *  Phase 2 — Embed      : saare answers ke embeddings batch mein generate    [parallel, N=10]
+ *  Phase 3 — Fetch      : vector search + Firestore ek saath                 [parallel, N=10]
+ *  Phase 4 — Grade      : Gemini grading controlled concurrency ke saath     [parallel, N=GRADING_CONCURRENCY]
+ *  Phase 5 — Assemble   : results jodo aur sort karo                         [sync]
+ *
+ * @param {Array}  segmentedQuestions
+ * @param {string} examId
+ * @param {string} subjectId
+ * @param {object} student
+ * @param {string} jobId
+ * @returns {object}
+ */
+export async function gradeAllAnswers(segmentedQuestions, examId, subjectId, student, jobId) {
+  const startedAt = Date.now();
+
+  log.info('GRADING_PIPELINE_START', {
+    jobId, examId, subjectId,
+    totalQuestions: segmentedQuestions.length,
+    concurrency: GRADING_CONCURRENCY,
+  });
+
+  // ── Phase 1: Classify ──────────────────────────────────────────────────────
+  const { skipped, toProcess } = classifyQuestions(segmentedQuestions);
+
+  let gradedAnswers;
+
+  if (toProcess.length === 0) {
+    // Sab blank the — directly assemble karo
+    gradedAnswers = assembleResults(skipped, []);
+  } else {
+    // ── Phase 2: Batch embeddings ────────────────────────────────────────────
+    const withEmbeddings = await embedAllAnswers(toProcess, jobId);
+
+    // ── Phase 3: Vector search + Firestore (parallel) ────────────────────────
+    const withMetadata = await fetchAllModelAnswers(withEmbeddings, examId, subjectId, jobId);
+
+    // ── Phase 4: Parallel Gemini grading ────────────────────────────────────
+    const graded = await gradeAllParallel(withMetadata, jobId);
+
+    // ── Phase 5: Assemble ────────────────────────────────────────────────────
+    gradedAnswers = assembleResults(skipped, graded);
+  }
+
+  // ── Aggregate ──────────────────────────────────────────────────────────────
   const { totalMarks, maxMarks, percentage, gradingStatus, flaggedQuestions } =
     aggregateResults(gradedAnswers);
 
-  const result = {
-    examId,
-    subjectId,
-    student,
-    jobId,
-    gradingStatus,
-    totalMarks,
-    maxMarks,
-    percentage,
-    flaggedQuestions,
-    gradedAnswers,
-    gradedAt:         new Date().toISOString(),
-    processingTimeMs: Date.now() - startedAt,
-  };
+  const processingTimeMs = Date.now() - startedAt;
 
-  log.info('GRADING_COMPLETE', {
-    jobId,
-    gradingStatus,
-    totalMarks,
-    maxMarks,
-    percentage,
+  log.info('GRADING_PIPELINE_COMPLETE', {
+    jobId, gradingStatus, totalMarks, maxMarks, percentage,
     flaggedCount: flaggedQuestions.length,
-    processingTimeMs: result.processingTimeMs,
+    processingTimeMs,
   });
 
-  return result;
+  return {
+    examId, subjectId, student, jobId,
+    gradingStatus, totalMarks, maxMarks, percentage,
+    flaggedQuestions, gradedAnswers,
+    gradedAt:         new Date().toISOString(),
+    processingTimeMs,
+  };
 }
