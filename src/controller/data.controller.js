@@ -9,7 +9,7 @@ const storage = new Storage({
 });
 const firestore = new Firestore({ projectId: process.env.PROJECT_ID });
 // ─── Config ───────────────────────────────────────────────────────────────────
-const CENTRAL_BUCKET       = process.env.CENTRAL_BUCKET || "ai-exam-storage-470609-q7";
+const CENTRAL_BUCKET       = process.env.CENTRAL_BUCKET;
 
 
 const ALLOWED_TYPES = [

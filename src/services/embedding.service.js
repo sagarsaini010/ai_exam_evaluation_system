@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const embeddingModel = genAI.getGenerativeModel({apiKey: process.env.GEMINI_API_KEY, model: 'gemini-embedding-001'});
+const embeddingModel = genAI.getGenerativeModel({apiKey: process.env.GEMINI_API_KEY, model: process.env.GEMINI_EMBEDDING_MODEL});
 
 const RETRY_CONFIG = { maxAttempts: 3, baseDelayMs: 2000, maxDelayMs: 15000 };
 

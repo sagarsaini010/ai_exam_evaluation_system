@@ -28,8 +28,8 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.use('/api/v1', dataRoutes, uploadLimiter);   // recive pdf and jpeg file from frontend and send it to controller for processing
-app.use('/api/v1/qa', qaRoutes, apiLimiter);
+app.use('/api/v1',uploadLimiter , dataRoutes );   // recive pdf and jpeg file from frontend and send it to controller for processing
+app.use('/api/v1/qa', apiLimiter,qaRoutes );
 
 app.use((req, res) => {
   res.status(404).json({

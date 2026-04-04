@@ -5,7 +5,7 @@ import { generateEmbedding }     from '../services/embedding.service.js';
 import { upsertDatapoint }       from '../services/vectorSearch.service.js';
 
 const firestore = new Firestore({
-  projectId: process.env.GCP_PROJECT_ID || 'secure-brook-470609-q7',
+  projectId: process.env.GCP_PROJECT_ID,
 });
 
 const CONFIDENCE_THRESHOLD    = 0.85;

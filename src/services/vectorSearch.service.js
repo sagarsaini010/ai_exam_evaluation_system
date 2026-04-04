@@ -1,8 +1,8 @@
 import { v1 } from '@google-cloud/aiplatform';
 const { IndexServiceClient, MatchServiceClient } = v1;
 
-const PROJECT_ID    = process.env.GCP_PROJECT_ID       || 'secure-brook-470609-q7';
-const LOCATION      = process.env.GCP_LOCATION         || 'asia-south1';
+const PROJECT_ID    = process.env.GCP_PROJECT_ID;
+const LOCATION      = process.env.GCP_LOCATION;
 const INDEX_ID      = process.env.VECTOR_INDEX_ID;
 const INDEX_NAME    = `projects/${PROJECT_ID}/locations/${LOCATION}/indexes/${INDEX_ID}`;
 const ENDPOINT_ID   = process.env.VECTOR_ENDPOINT_ID;

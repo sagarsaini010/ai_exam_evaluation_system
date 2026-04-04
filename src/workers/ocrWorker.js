@@ -9,9 +9,9 @@ import { checkBatchOperation, parseBatchOutput } from '../../functions/process-o
 
 dotenv.config();
 
-const PROJECT_ID        = process.env.GCP_PROJECT_ID      || 'secure-brook-470609-q7';
-const SUBSCRIPTION      = process.env.OCR_SUBSCRIPTION    || 'exam-ocr-subscription';
-const MAX_MESSAGES      = parseInt(process.env.WORKER_MAX_MESSAGES    || '5',     10);
+const PROJECT_ID        = process.env.GCP_PROJECT_ID;
+const SUBSCRIPTION      = process.env.OCR_SUBSCRIPTION;
+const MAX_MESSAGES      = parseInt(process.env.WORKER_MAX_MESSAGES    || '10',     10);
 const DOWNLOAD_TIMEOUT  = parseInt(process.env.DOWNLOAD_TIMEOUT_MS    || '20000', 10);
 const OCR_LLM_TIMEOUT   = parseInt(process.env.OCR_LLM_TIMEOUT_MS     || '60000', 10);
 const SEG_LLM_TIMEOUT   = parseInt(process.env.SEG_LLM_TIMEOUT_MS     || '60000', 10);

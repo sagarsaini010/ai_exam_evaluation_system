@@ -11,12 +11,12 @@ import {
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({
-  model:            'gemini-3.1-flash-lite-preview',
+  model:            process.env.GOOGLE_GENERATIVE_MODEL,
   generationConfig: { temperature: 0 },
 });
 
 const firestore = new Firestore({
-  projectId: process.env.GCP_PROJECT_ID || 'secure-brook-470609-q7',
+  projectId: process.env.GCP_PROJECT_ID,
 });
 
 const log = {

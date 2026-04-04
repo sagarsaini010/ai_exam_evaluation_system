@@ -1,8 +1,8 @@
 import { DocumentProcessorServiceClient } from '@google-cloud/documentai/build/src/v1/index.js';
 
-const PROJECT_ID     = process.env.GCP_PROJECT_ID            || 'secure-brook-470609-q7';
-const LOCATION       = process.env.DOCUMENT_AI_LOCATION      || 'asia-south1';
-const PROCESSOR_ID   = process.env.DOCUMENT_AI_PROCESSOR_ID  || 'f9b5a9f31d819f11';
+const PROJECT_ID     = process.env.GCP_PROJECT_ID;
+const LOCATION       = process.env.DOCUMENT_AI_LOCATION;
+const PROCESSOR_ID   = process.env.DOCUMENT_AI_PROCESSOR_ID;
 const PROCESSOR_NAME = `projects/${PROJECT_ID}/locations/${LOCATION}/processors/${PROCESSOR_ID}`;
 
 // Typed PDFs are small — 60s is very generous, prevents forever-hang
